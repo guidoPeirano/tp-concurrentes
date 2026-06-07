@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Estado persistido en disco (se genera en runtime)
+*.json.bak
+/data/
+
+# Editores / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
