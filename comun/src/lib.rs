@@ -18,7 +18,10 @@ mod tests {
     use crate::mensajes::estacion_pasarela::{
         MensajeEstacionAPasarela, MensajePasarelaAEstacion, VotoResultado,
     };
-    use crate::mensajes::usuario_estacion::MensajeUsuarioAEstacion;
+    use crate::mensajes::usuario_estacion::{
+        MensajeEstacionAUsuarioConsulta, MensajeUsuario, MensajeUsuarioAEstacion,
+        MensajeUsuarioAEstacionConsulta,
+    };
     use crate::serializacion::{a_json, desde_json};
 
     /// Serializa un valor y lo vuelve a leer; debe ser idéntico.
@@ -88,6 +91,19 @@ mod tests {
                 cvv: "123".to_string(),
             },
         });
+    }
+
+    #[test]
+    fn round_trip_mensaje_consulta_usuario() {
+        round_trip(MensajeUsuario::Consulta(
+            MensajeUsuarioAEstacionConsulta::PreguntarLider,
+        ));
+        round_trip(MensajeEstacionAUsuarioConsulta::RespuestaLider {
+            lider_id: EstacionId(5),
+            lider_addr: "127.0.0.1:8005".parse().expect("addr válida"),
+            term: 3,
+        });
+        round_trip(MensajeEstacionAUsuarioConsulta::EnEleccion);
     }
 
     #[test]
