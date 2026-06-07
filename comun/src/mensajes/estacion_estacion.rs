@@ -1,5 +1,5 @@
 //! Estación ↔ Estación. TCP para lo crítico (eventos al líder, Ring de elección),
-//! UDP para el estado agregado periódico.
+//! UDP para el estado agregado periódico. Flujos completos en `docs/CASOS_DE_USO.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +7,8 @@ use crate::{Alquiler, BiciId, EstacionId, EventId, RentalId, Timestamp, UsuarioI
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MensajeEntreEstacionesTCP {
-    // --- Eventos hacia el líder ---
+    // --- Eventos hacia el líder (CU1 alta, CU2 cierre) ---
+    /// CU1 — la estación origen reporta un alquiler nuevo al líder (async).
     AlquilerAbierto {
         event_id: EventId,
         rental_id: RentalId,
@@ -17,39 +18,44 @@ pub enum MensajeEntreEstacionesTCP {
         t0: Timestamp,
         preauth_id: String,
     },
+    /// CU2 — la estación destino avisa al líder que llegó una bici.
     NotificarDevolucion {
         event_id: EventId,
         bici_id: BiciId,
         estacion_destino: EstacionId,
         t1: Timestamp,
     },
+    /// CU2 — el líder informa a la estación destino el resultado del cobro.
     DevolucionProcesada {
         event_id: EventId,
         rental_id: RentalId,
         monto_cobrado: f64,
         tiempo_uso_minutos: u32,
     },
+    /// CU2 — el líder le avisa a la estación origen que el alquiler se cerró.
     CierreAlquiler {
         rental_id: RentalId,
         t1: Timestamp,
         monto_cobrado: f64,
     },
+    /// CU1/CU2 — ACK idempotente de un evento ya procesado por el líder.
     EventoProcesadoAck {
         event_id: EventId,
     },
 
-    // --- Reconstrucción del registro tras una elección ---
+    // --- CU4: reconstrucción del registro tras una elección ---
     SolicitarAlquileresAbiertos {
         term: u64,
     },
     RespuestaAlquileres {
         alquileres: Vec<Alquiler>,
     },
+    /// CU4 — una estación que se reincorpora tarde manda sus alquileres.
     IngresoTardio {
         alquileres: Vec<Alquiler>,
     },
 
-    // --- Manejo de bicis huérfanas ---
+    // --- CU2 (recuperación): manejo de bicis huérfanas ---
     BuscarAlquilerPropio {
         event_id: EventId,
         bici_id: BiciId,
@@ -72,11 +78,13 @@ pub enum MensajeEntreEstacionesTCP {
         bici_id: BiciId,
     },
 
-    // --- Ring de elección de líder ---
+    // --- CU4: Ring de elección de líder ---
+    /// CU4 — circula por el anillo acumulando ids; gana el mayor.
     Election {
         ids: Vec<EstacionId>,
         iniciador: EstacionId,
     },
+    /// CU4 — anuncia al líder electo por el anillo.
     Coordinator {
         lider: EstacionId,
         term: u64,
@@ -85,6 +93,7 @@ pub enum MensajeEntreEstacionesTCP {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MensajeEntreEstacionesUDP {
+    /// CU3 — snapshot periódico que alimenta la cache de disponibilidad del líder.
     EstadoEstacion {
         estacion_id: EstacionId,
         ubicacion: (f64, f64),
