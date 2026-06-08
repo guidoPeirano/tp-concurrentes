@@ -1,0 +1,11 @@
+[package]
+name = "estacion"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+comun = { path = "../comun" }
+actix = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

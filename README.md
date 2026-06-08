@@ -1140,7 +1140,7 @@ Esquema preliminar:
 cargo build --release
 
 # Lanzar el sistema de pagos
-cargo run --release --bin pasarela -- --puerto 9000 --config pasarela.toml
+cargo run --release --bin pasarela -- --puerto 9000 --config estaciones.toml
 
 # Lanzar estaciones (en terminales separadas)
 cargo run --release --bin estacion -- --id 1 --puerto 8001 --config estaciones.toml
@@ -1175,9 +1175,13 @@ ubicacion = [-34.6200, -58.3900]
 
 [pasarela]
 puerto = 9000
+
+[tarifa]
+base = 50.0
+por_minuto = 10.0
 ```
 
-El anillo lógico para Ring se construye por orden de `EstacionId`.
+El anillo lógico para Ring se construye por orden de `EstacionId`. El mismo archivo lo usan los tres binarios: la estación toma su entrada por `--id`, la pasarela usa `[pasarela]` y `[tarifa]`, y el usuario usa la lista de estaciones para descubrir al líder.
 
 ---
 
