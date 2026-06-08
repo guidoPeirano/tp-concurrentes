@@ -4,40 +4,32 @@
 
 mod usuario;
 
+use std::error::Error;
 use std::path::PathBuf;
 
-use clap::Parser;
 use comun::{Config, UsuarioId};
-use tracing::info;
 
 use crate::usuario::Usuario;
 
-#[derive(Parser)]
-#[command(about = "Cliente de usuario del sistema de alquiler de bicicletas")]
-struct Args {
-    /// Identificador del usuario (ej: alice).
-    #[arg(long)]
-    id: String,
-    /// Ruta al archivo de topología (estaciones.toml).
-    #[arg(long)]
-    config: PathBuf,
-}
+fn main() -> Result<(), Box<dyn Error>> {
+    let id_arg = comun::args::flag("--id").ok_or("falta el argumento --id")?;
+    let config_arg = comun::args::flag("--config").ok_or("falta el argumento --config")?;
 
-fn main() -> anyhow::Result<()> {
-    comun::logging::init();
-    let args = Args::parse();
-    let config = Config::cargar(&args.config)?;
+    let config = Config::cargar(&PathBuf::from(config_arg))?;
+    let usuario = Usuario::new(UsuarioId(id_arg));
 
-    let usuario = Usuario::new(UsuarioId(args.id));
-    info!(
-        usuario = ?usuario.id(),
-        estaciones_conocidas = config.estaciones.len(),
-        "usuario iniciado; topología cargada"
+    println!(
+        "[usuario {:?}] topología cargada: {} estaciones conocidas",
+        usuario.id(),
+        config.estaciones.len()
     );
     for estacion in &config.estaciones {
-        info!(estacion = %estacion.id, puerto = estacion.puerto, ubicacion = ?estacion.ubicacion, "estación conocida");
+        println!(
+            "  estación {} -> puerto {}, ubicacion {:?}",
+            estacion.id, estacion.puerto, estacion.ubicacion
+        );
     }
 
-    info!("(REPL interactiva pendiente — Etapa 2)");
+    println!("(REPL interactiva pendiente — Etapa 2)");
     Ok(())
 }

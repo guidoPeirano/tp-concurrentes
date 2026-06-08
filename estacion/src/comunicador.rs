@@ -6,7 +6,6 @@
 
 use actix::prelude::*;
 use comun::EstacionId;
-use tracing::info;
 
 pub struct Comunicador {
     estacion_id: EstacionId,
@@ -22,6 +21,6 @@ impl Actor for Comunicador {
     type Context = Context<Self>;
 
     fn started(&mut self, _ctx: &mut Self::Context) {
-        info!(estacion = %self.estacion_id, "actor Comunicador iniciado");
+        println!("[{}] actor Comunicador iniciado", self.estacion_id);
     }
 }

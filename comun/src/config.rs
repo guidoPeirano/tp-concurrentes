@@ -1,11 +1,14 @@
-//! Configuración de la topología, leída de un archivo TOML al arrancar cada
+//! Configuración de la topología, leída de un archivo JSON al arrancar cada
 //! proceso. La comparten las tres aplicaciones: la estación busca su propia
 //! entrada por id, la pasarela toma su puerto y la tarifa, y el usuario usa la
 //! lista de estaciones para descubrir al líder.
+//!
+//! Se usa JSON (vía `serde_json`) en vez de un formato que requiera una crate
+//! extra, para respetar la restricción de dependencias del enunciado.
 
+use std::error::Error;
 use std::path::Path;
 
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::EstacionId;
@@ -36,12 +39,10 @@ pub struct TarifaConfig {
 }
 
 impl Config {
-    /// Lee y parsea el archivo de configuración.
-    pub fn cargar(path: &Path) -> anyhow::Result<Config> {
-        let contenido = std::fs::read_to_string(path)
-            .with_context(|| format!("no pude leer la config en {}", path.display()))?;
-        let config = toml::from_str(&contenido)
-            .with_context(|| format!("no pude parsear el TOML de {}", path.display()))?;
+    /// Lee y parsea el archivo de configuración (JSON).
+    pub fn cargar(path: &Path) -> Result<Config, Box<dyn Error>> {
+        let contenido = std::fs::read_to_string(path)?;
+        let config = serde_json::from_str(&contenido)?;
         Ok(config)
     }
 
@@ -56,32 +57,20 @@ mod tests {
     use super::*;
 
     const EJEMPLO: &str = r#"
-[[estaciones]]
-id = 1
-puerto = 8001
-ubicacion = [-34.6037, -58.3816]
-
-[[estaciones]]
-id = 2
-puerto = 8002
-ubicacion = [-34.6100, -58.3850]
-
-[[estaciones]]
-id = 3
-puerto = 8003
-ubicacion = [-34.6200, -58.3900]
-
-[pasarela]
-puerto = 9000
-
-[tarifa]
-base = 50.0
-por_minuto = 10.0
-"#;
+    {
+      "estaciones": [
+        { "id": 1, "puerto": 8001, "ubicacion": [-34.6037, -58.3816] },
+        { "id": 2, "puerto": 8002, "ubicacion": [-34.6100, -58.3850] },
+        { "id": 3, "puerto": 8003, "ubicacion": [-34.6200, -58.3900] }
+      ],
+      "pasarela": { "puerto": 9000 },
+      "tarifa": { "base": 50.0, "por_minuto": 10.0 }
+    }
+    "#;
 
     #[test]
     fn parsea_config_de_ejemplo() {
-        let config: Config = toml::from_str(EJEMPLO).expect("parsea");
+        let config: Config = serde_json::from_str(EJEMPLO).expect("parsea");
         assert_eq!(config.estaciones.len(), 3);
         assert_eq!(config.estaciones[0].id, EstacionId(1));
         assert_eq!(config.estaciones[0].puerto, 8001);
@@ -94,7 +83,7 @@ por_minuto = 10.0
 
     #[test]
     fn busca_estacion_por_id() {
-        let config: Config = toml::from_str(EJEMPLO).unwrap();
+        let config: Config = serde_json::from_str(EJEMPLO).unwrap();
         assert_eq!(config.estacion(EstacionId(2)).unwrap().puerto, 8002);
         assert!(config.estacion(EstacionId(99)).is_none());
     }

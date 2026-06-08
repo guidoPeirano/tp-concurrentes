@@ -4,7 +4,6 @@
 //! y los handlers del 2PC se agregan en la Etapa 2.
 
 use actix::prelude::*;
-use tracing::debug;
 
 pub struct Slot {
     id: u32,
@@ -20,6 +19,6 @@ impl Actor for Slot {
     type Context = Context<Self>;
 
     fn started(&mut self, _ctx: &mut Self::Context) {
-        debug!(slot = self.id, "actor Slot iniciado");
+        println!("  slot {} iniciado", self.id);
     }
 }

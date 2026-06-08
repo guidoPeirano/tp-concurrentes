@@ -48,13 +48,9 @@ pub enum MensajeEstacionAUsuario {
         preauth_id: String,
     },
     /// CU1 — algún participante votó No (slot vacío, tarjeta inválida, ...).
-    AlquilerRechazado {
-        motivo: String,
-    },
+    AlquilerRechazado { motivo: String },
     /// CU2 — bici asegurada en el slot; el usuario ya puede irse.
-    DevolucionAceptada {
-        bici_id: BiciId,
-    },
+    DevolucionAceptada { bici_id: BiciId },
     /// CU2 — el líder cerró el alquiler y la pasarela cobró.
     DevolucionCompletada {
         rental_id: RentalId,

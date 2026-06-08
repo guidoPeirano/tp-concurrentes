@@ -21,8 +21,8 @@ Este documento organiza el desarrollo en etapas incrementales, de lo más genér
 - Workspace de Cargo con la crate library `comun` y los binarios `estacion`, `pasarela`, `usuario`.
 - Tipos base en `comun`: `EstacionId`, `RentalId`, `BiciId`, `EventId`, `TransaccionId`, `UsuarioId`, `DatosTarjeta`.
 - Definición de los enums de mensajes (vacíos o mínimos) con `serde::{Serialize, Deserialize}`.
-- Parsing del archivo de configuración `estaciones.toml` (estaciones, pasarela, tarifa).
-- Inicialización de logging (`tracing` o `env_logger`) y esqueletos de los actores `actix` que arrancan y quedan a la espera.
+- Parsing del archivo de configuración `estaciones.json` (estaciones, pasarela, tarifa) con `serde_json`.
+- Salida por consola (`println!`/`eprintln!`) y esqueletos de los actores `actix` que arrancan y quedan a la espera.
 
 **Entregable:** `cargo build` compila todo y cada binario levanta e imprime su configuración.
 

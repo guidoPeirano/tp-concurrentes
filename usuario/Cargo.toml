@@ -5,6 +5,3 @@ version.workspace = true
 
 [dependencies]
 comun = { path = "../comun" }
-clap = { workspace = true }
-tracing = { workspace = true }
-anyhow = { workspace = true }
