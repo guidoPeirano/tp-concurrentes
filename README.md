@@ -1140,44 +1140,35 @@ Esquema preliminar:
 cargo build --release
 
 # Lanzar el sistema de pagos
-cargo run --release --bin pasarela -- --puerto 9000 --config pasarela.toml
+cargo run --release --bin pasarela -- --puerto 9000 --config estaciones.json
 
 # Lanzar estaciones (en terminales separadas)
-cargo run --release --bin estacion -- --id 1 --puerto 8001 --config estaciones.toml
-cargo run --release --bin estacion -- --id 2 --puerto 8002 --config estaciones.toml
-cargo run --release --bin estacion -- --id 3 --puerto 8003 --config estaciones.toml
+cargo run --release --bin estacion -- --id 1 --puerto 8001 --config estaciones.json
+cargo run --release --bin estacion -- --id 2 --puerto 8002 --config estaciones.json
+cargo run --release --bin estacion -- --id 3 --puerto 8003 --config estaciones.json
 
 # Lanzar usuarios (en terminales separadas)
-cargo run --release --bin usuario -- --id alice --config estaciones.toml
-cargo run --release --bin usuario -- --id bob --config estaciones.toml
+cargo run --release --bin usuario -- --id alice --config estaciones.json
+cargo run --release --bin usuario -- --id bob --config estaciones.json
 ```
 
 Cada proceso lee input por consola para simular las acciones (acercarse a un slot, perder/recuperar conectividad, etc.) y escribe el output del sistema también por consola. El `usuario` arranca con el mismo `estaciones.toml` para conocer las direcciones de las estaciones y poder descubrir al líder.
 
 ### Archivo de configuración de topología (ejemplo)
 
-```toml
-# estaciones.toml
-[[estaciones]]
-id = 1
-puerto = 8001
-ubicacion = [-34.6037, -58.3816]
-
-[[estaciones]]
-id = 2
-puerto = 8002
-ubicacion = [-34.6100, -58.3850]
-
-[[estaciones]]
-id = 3
-puerto = 8003
-ubicacion = [-34.6200, -58.3900]
-
-[pasarela]
-puerto = 9000
+```json
+{
+  "estaciones": [
+    { "id": 1, "puerto": 8001, "ubicacion": [-34.6037, -58.3816] },
+    { "id": 2, "puerto": 8002, "ubicacion": [-34.6100, -58.3850] },
+    { "id": 3, "puerto": 8003, "ubicacion": [-34.6200, -58.3900] }
+  ],
+  "pasarela": { "puerto": 9000 },
+  "tarifa": { "base": 50.0, "por_minuto": 10.0 }
+}
 ```
 
-El anillo lógico para Ring se construye por orden de `EstacionId`.
+Usamos JSON (no TOML) para no depender de una crate extra de parsing, respetando la restricción de dependencias del enunciado. El anillo lógico para Ring se construye por orden de `EstacionId`. El mismo archivo lo usan los tres binarios: la estación toma su entrada por `--id`, la pasarela usa `pasarela` y `tarifa`, y el usuario usa la lista de estaciones para descubrir al líder.
 
 ---
 
