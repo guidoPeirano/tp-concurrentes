@@ -16,7 +16,7 @@ repartimos por subsistema.
 | 1 — Comunicación | `Comunicador`, TCP/UDP, framing | Guido |
 | 2 — Estación local | `Slot`, `Estacion`, REPL usuario | Guido |
 | 3 — Pasarela + 2PC | `ProcesadorPagos`, coordinador 2PC | Tomas, Paul |
-| 4 — Líder fijo | registro, devolución (CU2), cloud + consulta (CU3) | Paul, Tomas |
+| 4 — Líder fijo | registro, devolución (CU2), discovery + consulta directa al líder (CU3) | Paul, Tomas |
 | 5 — Elección de líder | algoritmo Ring, reconstrucción de registro | Guido, Paul |
 | 6 — Tolerancia a fallas | timeouts 2PC, idempotencia, persistencia, huérfanas | Tomas, Paul |
 | 7 — Modo desconectado | servicios alcanzables, pagos pendientes, regularización | Tomas, Paul |
