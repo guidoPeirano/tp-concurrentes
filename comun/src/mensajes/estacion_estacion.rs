@@ -25,14 +25,14 @@ pub enum MensajeEntreEstacionesTCP {
         estacion_destino: EstacionId,
         t1: Timestamp,
     },
-    /// CU2 — el líder informa a la estación destino el resultado del cobro.
+    /// CU2 — la estación destino le informa al líder el resultado del cobro.
     DevolucionProcesada {
         event_id: EventId,
         rental_id: RentalId,
         monto_cobrado: f64,
         tiempo_uso_minutos: u32,
     },
-    /// CU2 — el líder le avisa a la estación origen que el alquiler se cerró.
+    /// CU2 — la estación destino le avisa a la estación origen que el alquiler se cerró.
     CierreAlquiler {
         rental_id: RentalId,
         t1: Timestamp,

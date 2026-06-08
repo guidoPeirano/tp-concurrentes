@@ -71,9 +71,12 @@ registrado en la estación origen y en el líder.
 
 ## CU2 — Devolución (camino feliz)
 
-El usuario llega a una estación distinta (B), deja la bici en un slot vacío. La
-estación B asegura la bici y avisa al líder, que busca el alquiler, le pide a la
-pasarela el cobro proporcional al tiempo, y cierra el alquiler en todos lados.
+El usuario llega a una estación distinta (B) y deja la bici en un slot vacío.
+**La Estación B es quien cobra**: asegura la bici, le pide al líder los datos del
+alquiler (`DatosParaCobro`), cobra a la pasarela, y notifica el cierre tanto al
+líder como a la estación de origen. El líder no toca la pasarela ni propaga el
+cierre: solo entrega los datos y actualiza su registro. Así, si el líder se cae
+después de dar los datos, B igual termina la devolución por su cuenta.
 
 ```
 Usuario      Estación B        Slot N      Líder         Pasarela     Estación A (origen)
@@ -84,14 +87,15 @@ Usuario      Estación B        Slot N      Líder         Pasarela     Estació
    │ DevolucionAceptada (red)                                               │
    │◄──────────────┤  (el usuario ya puede irse)                            │
    │               │── NotificarDevolucion ──►│ (red)                       │
-   │                              busca alquiler (tiene t0, preauth_id)      │
-   │                                  │── ProcesarCobro(preauth_id,t0,t1) ──►│ (red)
-   │                                  │◄──── CobroConfirmado(monto) ─────────┤ (red)
-   │                              marca alquiler Cerrado                     │
-   │               │◄── DevolucionProcesada(monto, tiempo) ──┤ (red)         │
+   │               │◄─ DatosParaCobro(preauth_id, t0, origen=A) ─┤ (red)     │
+   │               │      (o NoRegistradoAun → B reintenta con backoff)      │
+   │               │── ProcesarCobro(preauth_id, t0, t1) ───────────►│ (red) │
+   │               │◄──────── CobroConfirmado(monto) ────────────────┤ (red) │
+   │   B notifica el cierre a ambos (en paralelo, reintento idempotente):    │
+   │               │── DevolucionProcesada ──►│ (red, al líder)             │
+   │               │── CierreAlquiler ──────────────────────────────────────►│ (red, al origen)
    │ DevolucionCompletada (red)                                             │
    │◄──────────────┤                                                        │
-   │                              │── CierreAlquiler ───────────────────────►│ (red, async)
 ```
 
 **Mensajes que usa:**
@@ -102,10 +106,14 @@ Usuario      Estación B        Slot N      Líder         Pasarela     Estació
 | Asegurar la bici | `AceptarBici { bici_id }` → `BiciAsegurada` | actor |
 | Aviso al usuario | `MensajeEstacionAUsuario::DevolucionAceptada` | red |
 | Aviso al líder | `MensajeEntreEstacionesTCP::NotificarDevolucion` | red |
-| Cobro | `MensajeEstacionAPasarela::ProcesarCobro` → `CobroConfirmado` | red |
-| Resultado a la estación B | `MensajeEntreEstacionesTCP::DevolucionProcesada` | red |
+| Datos para cobrar | `MensajeEntreEstacionesTCP::DatosParaCobro` (o `NoRegistradoAun` → B reintenta) | red |
+| Cobro (lo hace B) | `MensajeEstacionAPasarela::ProcesarCobro` → `CobroConfirmado` | red |
+| Cierre al líder | `MensajeEntreEstacionesTCP::DevolucionProcesada` | red |
+| Cierre al origen | `MensajeEntreEstacionesTCP::CierreAlquiler` | red |
 | Confirmación al usuario | `MensajeEstacionAUsuario::DevolucionCompletada` | red |
-| Cierre en el origen | `MensajeEntreEstacionesTCP::CierreAlquiler` | red |
+
+> `DatosParaCobro` y `NoRegistradoAun` se agregan a `comun` en la etapa de la
+> devolución (Etapa 4); por eso todavía no están en el código.
 
 > **Bicis huérfanas:** si el líder recibe una `NotificarDevolucion` de una bici que
 > no tiene en su registro, dispara el subprotocolo de bicis huérfanas
@@ -194,4 +202,4 @@ Estación A        B          C          E (gana, id mayor)
 
 - **`usuario_estacion.rs`**: operaciones → CU1/CU2; consultas/discovery → CU3.
 - **`estacion_pasarela.rs`**: `Prepare*`/`Commit*`/`Abort*Preauth` + `Voto` → CU1; `ProcesarCobro` + `Cobro*` → CU2.
-- **`estacion_estacion.rs`**: `AlquilerAbierto` → CU1; `NotificarDevolucion`/`DevolucionProcesada`/`CierreAlquiler` + huérfanas → CU2; `Election`/`Coordinator`/`Solicitar*`/`Respuesta*`/`IngresoTardio` → CU4; `EstadoEstacion` (UDP) → CU3.
+- **`estacion_estacion.rs`**: `AlquilerAbierto` → CU1; `NotificarDevolucion`/`DatosParaCobro`/`NoRegistradoAun`/`DevolucionProcesada`/`CierreAlquiler` + huérfanas → CU2; `Election`/`Coordinator`/`Solicitar*`/`Respuesta*`/`IngresoTardio` → CU4; `EstadoEstacion` (UDP) → CU3.
