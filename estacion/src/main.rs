@@ -58,16 +58,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             })
             .collect();
-        let estacion = Estacion::new(id, mi_config.ubicacion).start();
+        // La Estacion toma posesión de los slots (mantiene vivas sus Addr).
+        let estacion = Estacion::new(id, mi_config.ubicacion, slots).start();
         let comunicador =
             Comunicador::new(addr_red, addr_red, estacion.clone().recipient()).start();
         println!(
             "[estacion {}] escuchando en {} (TCP+UDP); {} slots; a la espera (ctrl-c para salir)",
-            id_arg,
-            addr_red,
-            slots.len()
+            id_arg, addr_red, SLOTS_POR_ESTACION
         );
-        (comunicador, slots, estacion)
+        (comunicador, estacion)
     });
 
     system.run()?;
