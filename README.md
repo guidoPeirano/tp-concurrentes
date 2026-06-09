@@ -241,6 +241,8 @@ A `Estacion`: `Voto(Yes/No)`, `BiciLiberada`, `BiciAsegurada`, `EstadoSlot`.
 
 **Finalidad.** Aísla la lógica de red. Mantiene los sockets TCP y UDP, gestiona la conexión con vecinas y con el líder, encola mensajes diferidos durante períodos sin conectividad o sin líder conocido, y lleva el registro de qué servicios alcanza en este momento.
 
+> El `Comunicador` es un actor **compartido** (vive en la crate `comun`), porque tanto la estación como la pasarela necesitan el mismo manejo de sockets con framing. Reenvía cada payload recibido al actor de negocio (vía un `Recipient`), que lo deserializa. Los campos específicos de la estación (`cola_para_lider`, `ServiciosAlcanzables`) que se describen abajo se incorporan en las etapas de tolerancia a fallas y modo desconectado.
+
 **Estado interno.**
 
 ```rust
@@ -1085,13 +1087,17 @@ tp-concurrentes/
 ├── README.md                        (este archivo)
 ├── PLAN.md                          (plan de trabajo)
 ├── PLAN_DESARROLLO.md               (etapas de desarrollo y criterios de aceptación)
-├── comun/                           (crate library: tipos compartidos)
+├── comun/                           (crate library: tipos compartidos + red)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
 │       ├── ids.rs                   (EstacionId, RentalId, BiciId, EventId, DatosTarjeta, ...)
 │       ├── tiempo.rs                (Timestamp)
 │       ├── dominio.rs               (Alquiler, EstadoAlquiler, InfoEstacion)
+│       ├── config.rs               (parsing de estaciones.json)
+│       ├── args.rs                 (parsing de argumentos CLI)
+│       ├── framing.rs              (framing length-prefix para TCP)
+│       ├── comunicador.rs          (actor Comunicador: TCP/UDP, compartido)
 │       ├── mensajes/
 │       │   ├── mod.rs
 │       │   ├── usuario_estacion.rs  (operaciones + consulta/discovery + envelope MensajeUsuario)
@@ -1104,7 +1110,6 @@ tp-concurrentes/
 │       ├── main.rs
 │       ├── estacion.rs              (actor Estacion)
 │       ├── slot.rs                  (actor Slot)
-│       ├── comunicador.rs           (actor Comunicador + ServiciosAlcanzables)
 │       ├── pago_pendiente.rs        (PagoPendiente)
 │       ├── ring.rs                  (lógica del algoritmo de elección)
 │       ├── dos_fases.rs             (helpers del 2PC)
@@ -1114,7 +1119,6 @@ tp-concurrentes/
 │   └── src/
 │       ├── main.rs
 │       ├── procesador_pagos.rs      (actor ProcesadorPagos)
-│       ├── comunicador.rs           (actor Comunicador)
 │       ├── tarifa.rs                (cálculo del monto)
 │       └── persistencia.rs
 └── usuario/                         (crate binary)

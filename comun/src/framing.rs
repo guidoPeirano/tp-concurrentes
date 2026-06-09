@@ -13,14 +13,19 @@ use serde::{de::DeserializeOwned, Serialize};
 /// Tamaño del prefijo de longitud (u32 big-endian).
 const PREFIJO: usize = 4;
 
-/// Serializa un mensaje a JSON y lo enmarca con su prefijo de longitud.
-pub fn enmarcar<T: Serialize>(mensaje: &T) -> Result<Vec<u8>, Box<dyn Error>> {
-    let payload = serde_json::to_vec(mensaje)?;
+/// Enmarca un payload ya serializado, anteponiéndole su longitud. Lo usa la capa
+/// de red, que trabaja con bytes y es agnóstica del tipo de mensaje.
+pub fn enmarcar_payload(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let len = u32::try_from(payload.len())?;
     let mut frame = Vec::with_capacity(PREFIJO + payload.len());
     frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// Serializa un mensaje a JSON y lo enmarca con su prefijo de longitud.
+pub fn enmarcar<T: Serialize>(mensaje: &T) -> Result<Vec<u8>, Box<dyn Error>> {
+    enmarcar_payload(&serde_json::to_vec(mensaje)?)
 }
 
 /// Acumula bytes recibidos del stream y extrae mensajes completos a medida que
@@ -40,27 +45,33 @@ impl Desenmarcador {
         self.buffer.extend_from_slice(datos);
     }
 
-    /// Extrae y deserializa el próximo mensaje completo del buffer.
-    ///
-    /// Devuelve `Ok(None)` si todavía no hay un mensaje entero (faltan bytes del
-    /// prefijo o del payload). Llamarla en loop drena todos los mensajes
-    /// disponibles.
-    pub fn siguiente<T: DeserializeOwned>(&mut self) -> Result<Option<T>, Box<dyn Error>> {
+    /// Extrae el próximo payload completo (bytes, sin deserializar). Devuelve
+    /// `None` si todavía no hay un mensaje entero (faltan bytes del prefijo o del
+    /// payload). Es lo que usa la capa de red.
+    pub fn siguiente_payload(&mut self) -> Option<Vec<u8>> {
         if self.buffer.len() < PREFIJO {
-            return Ok(None);
+            return None;
         }
         let mut len_bytes = [0u8; PREFIJO];
         len_bytes.copy_from_slice(&self.buffer[..PREFIJO]);
         let len = u32::from_be_bytes(len_bytes) as usize;
 
         if self.buffer.len() < PREFIJO + len {
-            return Ok(None);
+            return None;
         }
 
         let payload = self.buffer[PREFIJO..PREFIJO + len].to_vec();
         self.buffer.drain(..PREFIJO + len);
-        let mensaje = serde_json::from_slice(&payload)?;
-        Ok(Some(mensaje))
+        Some(payload)
+    }
+
+    /// Igual que `siguiente_payload`, pero además deserializa al tipo esperado.
+    /// Cómodo para tests y para quien conoce el tipo del mensaje.
+    pub fn siguiente<T: DeserializeOwned>(&mut self) -> Result<Option<T>, Box<dyn Error>> {
+        match self.siguiente_payload() {
+            Some(payload) => Ok(Some(serde_json::from_slice(&payload)?)),
+            None => Ok(None),
+        }
     }
 }
 
