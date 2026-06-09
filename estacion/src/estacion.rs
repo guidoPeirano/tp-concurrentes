@@ -1,10 +1,11 @@
 //! Actor coordinador de la estación.
 //!
-//! Esqueleto de la Etapa 0: arranca y avisa por consola. El estado (alquileres,
-//! rol de líder, term) y los handlers (2PC, Ring, devolución) se agregan en las
-//! etapas siguientes.
+//! Etapa 1: además de arrancar, recibe los paquetes de red que le reenvía el
+//! `Comunicador` y los loguea. El procesamiento real de cada mensaje (2PC, Ring,
+//! devolución) se agrega en las etapas siguientes.
 
 use actix::prelude::*;
+use comun::comunicador::{PaqueteRecibido, Transporte};
 use comun::EstacionId;
 
 pub struct Estacion {
@@ -25,6 +26,23 @@ impl Actor for Estacion {
         println!(
             "[{}] actor Estacion iniciado (ubicacion {:?})",
             self.id, self.ubicacion
+        );
+    }
+}
+
+impl Handler<PaqueteRecibido> for Estacion {
+    type Result = ();
+
+    fn handle(&mut self, msg: PaqueteRecibido, _ctx: &mut Self::Context) {
+        let via = match msg.transporte {
+            Transporte::Tcp => "TCP",
+            Transporte::Udp => "UDP",
+        };
+        println!(
+            "[{}] paquete recibido por {} ({} bytes)",
+            self.id,
+            via,
+            msg.datos.len()
         );
     }
 }

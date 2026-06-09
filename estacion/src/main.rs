@@ -1,17 +1,18 @@
-//! Binario de la estación. Por ahora (Etapa 0) parsea la config, levanta los
-//! actores esqueleto y queda a la espera. La lógica real se agrega etapa por etapa.
+//! Binario de la estación. Parsea la config, levanta los actores (incluido el
+//! Comunicador, que abre los sockets TCP/UDP) y queda a la espera. La lógica de
+//! negocio se agrega etapa por etapa.
 
-mod comunicador;
 mod estacion;
 mod slot;
 
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use actix::prelude::*;
+use comun::comunicador::Comunicador;
 use comun::{Config, EstacionId};
 
-use crate::comunicador::Comunicador;
 use crate::estacion::Estacion;
 use crate::slot::Slot;
 
@@ -40,16 +41,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.estaciones.len()
     );
 
+    // TCP y UDP comparten el número de puerto (son protocolos distintos).
+    let addr_red = SocketAddr::from(([127, 0, 0, 1], puerto));
+
     let system = System::new();
     let _actores = system.block_on(async move {
-        let comunicador = Comunicador::new(id).start();
         let slots: Vec<Addr<Slot>> = (0..SLOTS_POR_ESTACION)
             .map(|i| Slot::nuevo(i).start())
             .collect();
         let estacion = Estacion::new(id, mi_config.ubicacion).start();
+        let comunicador =
+            Comunicador::new(addr_red, addr_red, estacion.clone().recipient()).start();
         println!(
-            "[estacion {}] {} slots creados; estación a la espera (ctrl-c para salir)",
+            "[estacion {}] escuchando en {} (TCP+UDP); {} slots; a la espera (ctrl-c para salir)",
             id_arg,
+            addr_red,
             slots.len()
         );
         (comunicador, slots, estacion)
