@@ -3,6 +3,7 @@
 //! negocio se agrega etapa por etapa.
 
 mod estacion;
+mod mensajes;
 mod slot;
 
 use std::error::Error;
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 
 use actix::prelude::*;
 use comun::comunicador::Comunicador;
-use comun::{Config, EstacionId};
+use comun::{BiciId, Config, EstacionId};
 
 use crate::estacion::Estacion;
 use crate::slot::Slot;
@@ -46,8 +47,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let system = System::new();
     let _actores = system.block_on(async move {
+        // La estación arranca con bicis en la primera mitad de sus slots. El id de
+        // cada bici se deriva del id de la estación para que sea único en el sistema.
         let slots: Vec<Addr<Slot>> = (0..SLOTS_POR_ESTACION)
-            .map(|i| Slot::nuevo(i).start())
+            .map(|i| {
+                if i < SLOTS_POR_ESTACION / 2 {
+                    Slot::con_bici(i, BiciId(id.0 * 100 + i)).start()
+                } else {
+                    Slot::nuevo(i).start()
+                }
+            })
             .collect();
         let estacion = Estacion::new(id, mi_config.ubicacion).start();
         let comunicador =
