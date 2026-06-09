@@ -2,6 +2,7 @@
 //! tipos de dominio, mensajes de red y helpers de serialización.
 
 pub mod args;
+pub mod comunicador;
 pub mod config;
 pub mod dominio;
 pub mod framing;
