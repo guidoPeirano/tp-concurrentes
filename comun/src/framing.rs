@@ -86,6 +86,7 @@ mod tests {
             usuario_id: UsuarioId("alice".to_string()),
             bici_id: BiciId(7),
             rental_id: RentalId("R1".to_string()),
+            slot_id: 3,
         }
     }
 

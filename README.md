@@ -409,6 +409,7 @@ enum MensajeUsuarioAEstacion {
         usuario_id: UsuarioId,
         bici_id: BiciId,
         rental_id: RentalId,
+        slot_id: u32,
     },
 }
 
@@ -423,6 +424,9 @@ enum MensajeEstacionAUsuario {
     },
     DevolucionAceptada {
         bici_id: BiciId,
+    },
+    DevolucionRechazada {
+        motivo: String,
     },
     DevolucionCompletada {
         rental_id: RentalId,

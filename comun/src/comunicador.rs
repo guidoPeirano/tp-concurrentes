@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -24,13 +25,28 @@ pub enum Transporte {
     Udp,
 }
 
+/// Permite responder por la misma conexión TCP por la que llegó un pedido
+/// (patrón request-response). Para UDP y para mensajes sin respuesta es `None`.
+pub struct Responder {
+    tx: Sender<Vec<u8>>,
+}
+
+impl Responder {
+    /// Envía la respuesta (bytes ya serializados) de vuelta por la conexión.
+    pub fn responder(self, datos: Vec<u8>) {
+        let _ = self.tx.send(datos);
+    }
+}
+
 /// Un payload (bytes ya desenmarcados) recibido de la red. El Comunicador se lo
-/// reenvía al actor de negocio, que lo deserializa al tipo que espera.
+/// reenvía al actor de negocio, que lo deserializa al tipo que espera. Si vino
+/// por TCP, trae un `Responder` para contestar por la misma conexión.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct PaqueteRecibido {
     pub transporte: Transporte,
     pub datos: Vec<u8>,
+    pub responder: Option<Responder>,
 }
 
 /// Pide enviar un payload por TCP (con framing) a un destino.
@@ -128,10 +144,21 @@ fn leer_stream_tcp(mut stream: TcpStream, destino: Recipient<PaqueteRecibido>) {
             Ok(n) => {
                 desenmarcador.alimentar(&buf[..n]);
                 while let Some(payload) = desenmarcador.siguiente_payload() {
+                    // Por cada pedido, le damos al actor un canal para responder.
+                    let (tx, rx) = mpsc::channel();
                     destino.do_send(PaqueteRecibido {
                         transporte: Transporte::Tcp,
                         datos: payload,
+                        responder: Some(Responder { tx }),
                     });
+                    // Esperamos la respuesta y la devolvemos por la misma conexión.
+                    // Si el actor no responde (mensaje fire-and-forget), suelta el
+                    // `Responder` y `recv` corta sin escribir nada.
+                    if let Ok(respuesta) = rx.recv() {
+                        if let Ok(frame) = enmarcar_payload(&respuesta) {
+                            let _ = stream.write_all(&frame);
+                        }
+                    }
                 }
             }
             Err(_) => break,
@@ -151,6 +178,7 @@ fn escuchar_udp(addr: SocketAddr, destino: Recipient<PaqueteRecibido>) -> UdpSoc
             destino.do_send(PaqueteRecibido {
                 transporte: Transporte::Udp,
                 datos: buf[..n].to_vec(),
+                responder: None,
             });
         }
     });
