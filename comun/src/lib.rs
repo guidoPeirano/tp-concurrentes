@@ -4,6 +4,7 @@
 pub mod args;
 pub mod config;
 pub mod dominio;
+pub mod framing;
 pub mod ids;
 pub mod mensajes;
 pub mod serializacion;
