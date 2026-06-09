@@ -1,12 +1,17 @@
-//! Binario de la pasarela de pagos (mock). Etapa 0: parsea config, levanta el
-//! actor esqueleto y queda a la espera.
+//! Binario de la pasarela de pagos (mock). Parsea config, levanta el
+//! `ProcesadorPagos` detrás de un `Comunicador` (atiende pedidos de las
+//! estaciones por TCP) y queda a la espera.
 
+mod mensajes;
 mod procesador_pagos;
+mod tarifa;
 
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use actix::prelude::*;
+use comun::comunicador::Comunicador;
 use comun::Config;
 
 use crate::procesador_pagos::ProcesadorPagos;
@@ -23,11 +28,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         puerto, config.tarifa.base, config.tarifa.por_minuto
     );
 
+    let addr_red = SocketAddr::from(([127, 0, 0, 1], puerto));
+
     let system = System::new();
-    let _actor = system.block_on(async move {
+    let _actores = system.block_on(async move {
         let procesador = ProcesadorPagos::new(config.tarifa.clone()).start();
-        println!("[pasarela] a la espera (ctrl-c para salir)");
-        procesador
+        let comunicador =
+            Comunicador::new(addr_red, addr_red, procesador.clone().recipient()).start();
+        println!("[pasarela] escuchando en {addr_red} (TCP); a la espera (ctrl-c para salir)");
+        (comunicador, procesador)
     });
 
     system.run()?;
