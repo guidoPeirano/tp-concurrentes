@@ -2,7 +2,16 @@
 //! No viajan por la red, así que no están en la crate `comun`.
 
 use actix::prelude::*;
+use comun::mensajes::usuario_estacion::{MensajeEstacionAUsuario, MensajeUsuarioAEstacion};
 use comun::{BiciId, TransaccionId};
+
+/// Un pedido de usuario (alquiler/devolución) que la estación procesa localmente:
+/// rutea al slot que corresponde y coordina el 2PC. Envuelve el mensaje de red
+/// para poder enviarlo como mensaje de actor. La respuesta es la misma que iría
+/// de vuelta al usuario.
+#[derive(Message)]
+#[rtype(result = "MensajeEstacionAUsuario")]
+pub struct SolicitudUsuario(pub MensajeUsuarioAEstacion);
 
 /// Fase Prepare del 2PC sobre el `Slot`: pide reservar la bici para una
 /// transacción. Responde con el voto.
