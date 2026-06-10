@@ -24,10 +24,19 @@ use comun::{Alquiler, EstacionId, EstadoAlquiler, EventId, RentalId, Timestamp, 
 
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarRegistro, PrepareLiberacion,
-    RegistrarComunicador, SolicitudUsuario, Voto,
+    ProcesarDevolucion, RegistrarComunicador, SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
+
+/// Datos que el destino necesita para cobrar y cerrar una devolución (los obtiene
+/// del registro del líder).
+struct DatosCobro {
+    rental_id: RentalId,
+    preauth_id: String,
+    t0: Timestamp,
+    estacion_origen: EstacionId,
+}
 
 /// Rol de la estación: una es el líder (mantiene el registro autoritativo), el
 /// resto son followers.
@@ -46,6 +55,8 @@ pub struct Estacion {
     pasarela: SocketAddr,
     /// Dirección del líder (a quién reportar los alquileres si soy follower).
     lider: SocketAddr,
+    /// Direcciones de todas las estaciones, para alcanzar al origen en la devolución.
+    estaciones: HashMap<EstacionId, SocketAddr>,
     rol: RolEstacion,
     /// `Addr` del Comunicador propio (se cablea al arrancar con `RegistrarComunicador`).
     comunicador: Option<Addr<Comunicador>>,
@@ -62,6 +73,7 @@ impl Estacion {
         pasarela: SocketAddr,
         lider: SocketAddr,
         es_lider: bool,
+        estaciones: HashMap<EstacionId, SocketAddr>,
     ) -> Self {
         Self {
             id,
@@ -69,6 +81,7 @@ impl Estacion {
             slots,
             pasarela,
             lider,
+            estaciones,
             rol: if es_lider {
                 RolEstacion::Lider(Registro::new())
             } else {
@@ -172,7 +185,13 @@ impl Estacion {
                     registro.cerrar(&rental_id);
                 }
             }
-            // CierreAlquiler (lado origen) en la 4b-2; Ring en la Etapa 5; huérfanas luego.
+            MensajeEntreEstacionesTCP::CierreAlquiler { rental_id, .. } => {
+                // Soy la estación de origen: marco mi alquiler como cerrado.
+                if let Some(alquiler) = self.alquileres_propios.get_mut(&rental_id) {
+                    alquiler.estado = EstadoAlquiler::Cerrado;
+                }
+            }
+            // Ring (Etapa 5) y manejo de huérfanas (Etapa 6) más adelante.
             _ => {}
         }
     }
@@ -234,6 +253,113 @@ impl Handler<ConsultarRegistro> for Estacion {
     }
 }
 
+impl Handler<ProcesarDevolucion> for Estacion {
+    type Result = ResponseActFuture<Self, ()>;
+
+    fn handle(&mut self, msg: ProcesarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
+        // Datos de cobro: si soy el líder los busco en mi registro (en proceso);
+        // si soy follower los consulto por red (más abajo).
+        let es_lider = matches!(self.rol, RolEstacion::Lider(_));
+        let datos_si_lider = if let RolEstacion::Lider(registro) = &self.rol {
+            registro.buscar_por_bici(msg.bici_id).map(|a| DatosCobro {
+                rental_id: a.rental_id.clone(),
+                preauth_id: a.preauth_id.clone(),
+                t0: a.inicio,
+                estacion_origen: a.estacion_origen,
+            })
+        } else {
+            None
+        };
+        let comunicador = self.comunicador.clone();
+        let lider = self.lider;
+        let pasarela = self.pasarela;
+        let mi_id = self.id;
+        let bici_id = msg.bici_id;
+        let t1 = msg.t1;
+        let n = self.proximo();
+        let event_id = EventId(format!("E-{}-{}", self.id.0, n));
+
+        Box::pin(
+            async move {
+                let datos = if es_lider {
+                    datos_si_lider
+                } else {
+                    consultar_lider_devolucion(
+                        &comunicador,
+                        lider,
+                        event_id.clone(),
+                        bici_id,
+                        mi_id,
+                        t1,
+                    )
+                    .await
+                };
+                let datos = datos?;
+                // Cobro a la pasarela (proporcional a t1 - t0).
+                let cobro = MensajeEstacionAPasarela::ProcesarCobro {
+                    preauth_id: datos.preauth_id.clone(),
+                    t0: datos.t0,
+                    t1,
+                };
+                let monto = match consultar_pasarela(&comunicador, pasarela, &cobro).await {
+                    Some(MensajePasarelaAEstacion::CobroConfirmado { monto, .. }) => monto,
+                    _ => 0.0,
+                };
+                Some((datos, monto, event_id))
+            }
+            .into_actor(self)
+            .map(move |resultado, actor, _ctx| {
+                let Some((datos, monto, event_id)) = resultado else {
+                    return; // NoRegistradoAun / huérfana: se maneja en la Etapa 6.
+                };
+                let tiempo = datos.t0.minutos_hasta(t1);
+
+                // Cerrar en el líder (en proceso si soy líder; por red si no).
+                if let RolEstacion::Lider(registro) = &mut actor.rol {
+                    registro.cerrar(&datos.rental_id);
+                } else if let (Some(comunicador), Ok(bytes)) = (
+                    &actor.comunicador,
+                    comun::serializacion::a_bytes(
+                        &MensajeEntreEstacionesTCP::DevolucionProcesada {
+                            event_id,
+                            rental_id: datos.rental_id.clone(),
+                            monto_cobrado: monto,
+                            tiempo_uso_minutos: tiempo,
+                        },
+                    ),
+                ) {
+                    comunicador.do_send(EnviarTcp {
+                        destino: actor.lider,
+                        datos: bytes,
+                    });
+                }
+
+                // Cerrar en el origen (en proceso si el origen soy yo; por red si no).
+                if datos.estacion_origen == actor.id {
+                    if let Some(alquiler) = actor.alquileres_propios.get_mut(&datos.rental_id) {
+                        alquiler.estado = EstadoAlquiler::Cerrado;
+                    }
+                } else if let Some(destino) = actor.estaciones.get(&datos.estacion_origen).copied()
+                {
+                    if let (Some(comunicador), Ok(bytes)) = (
+                        &actor.comunicador,
+                        comun::serializacion::a_bytes(&MensajeEntreEstacionesTCP::CierreAlquiler {
+                            rental_id: datos.rental_id.clone(),
+                            t1,
+                            monto_cobrado: monto,
+                        }),
+                    ) {
+                        comunicador.do_send(EnviarTcp {
+                            destino,
+                            datos: bytes,
+                        });
+                    }
+                }
+            }),
+        )
+    }
+}
+
 /// Le pide al Comunicador que haga el request-response con la pasarela y devuelve
 /// la respuesta deserializada (o `None` si no hay Comunicador o no se pudo).
 async fn consultar_pasarela(
@@ -252,6 +378,49 @@ async fn consultar_pasarela(
         .ok()
         .flatten()?;
     comun::serializacion::desde_bytes(&respuesta).ok()
+}
+
+/// Consulta al líder (por red) los datos de cobro de una bici que se está
+/// devolviendo. Devuelve `None` si el líder responde `NoRegistradoAun` (o falla).
+async fn consultar_lider_devolucion(
+    comunicador: &Option<Addr<Comunicador>>,
+    lider: SocketAddr,
+    event_id: EventId,
+    bici_id: comun::BiciId,
+    estacion_destino: EstacionId,
+    t1: Timestamp,
+) -> Option<DatosCobro> {
+    let comunicador = comunicador.as_ref()?;
+    let notif = MensajeEntreEstacionesTCP::NotificarDevolucion {
+        event_id,
+        bici_id,
+        estacion_destino,
+        t1,
+    };
+    let bytes = comun::serializacion::a_bytes(&notif).ok()?;
+    let respuesta = comunicador
+        .send(ConsultarTcp {
+            destino: lider,
+            datos: bytes,
+        })
+        .await
+        .ok()
+        .flatten()?;
+    match comun::serializacion::desde_bytes::<MensajeEntreEstacionesTCP>(&respuesta).ok()? {
+        MensajeEntreEstacionesTCP::DatosParaCobro {
+            rental_id,
+            preauth_id,
+            t0,
+            estacion_origen,
+            ..
+        } => Some(DatosCobro {
+            rental_id,
+            preauth_id,
+            t0,
+            estacion_origen,
+        }),
+        _ => None,
+    }
 }
 
 /// Lógica del alquiler/devolución, sin estado de la estación. Devuelve la
@@ -411,10 +580,16 @@ impl Handler<SolicitudUsuario> for Estacion {
         Box::pin(
             async move { procesar_operacion(msg.0, ctx).await }
                 .into_actor(self)
-                .map(|(respuesta, alquiler), actor, _ctx| {
+                .map(|(respuesta, alquiler), actor, ctx| {
                     if let Some(a) = alquiler {
                         actor.reportar_alquiler(&a);
                         actor.alquileres_propios.insert(a.rental_id.clone(), a);
+                    }
+                    if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta {
+                        ctx.address().do_send(ProcesarDevolucion {
+                            bici_id: *bici_id,
+                            t1: Timestamp::ahora(),
+                        });
                     }
                     respuesta
                 }),
@@ -445,10 +620,17 @@ impl Handler<PaqueteRecibido> for Estacion {
                         (respuesta, alquiler, responder)
                     }
                     .into_actor(self)
-                    .map(|(respuesta, alquiler, responder), actor, _ctx| {
+                    .map(|(respuesta, alquiler, responder), actor, ctx| {
                         if let Some(a) = alquiler {
                             actor.reportar_alquiler(&a);
                             actor.alquileres_propios.insert(a.rental_id.clone(), a);
+                        }
+                        if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta
+                        {
+                            ctx.address().do_send(ProcesarDevolucion {
+                                bici_id: *bici_id,
+                                t1: Timestamp::ahora(),
+                            });
                         }
                         if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
                             responder.responder(bytes);
@@ -503,8 +685,16 @@ mod tests {
     async fn arrancar(slots: Vec<Addr<Slot>>, pasarela: SocketAddr) -> Addr<Estacion> {
         // Como es líder, registra sus propios alquileres; la dirección de líder no se usa.
         let lider = "127.0.0.1:9".parse().unwrap();
-        let estacion =
-            Estacion::new(EstacionId(1), (0.0, 0.0), slots, pasarela, lider, true).start();
+        let estacion = Estacion::new(
+            EstacionId(1),
+            (0.0, 0.0),
+            slots,
+            pasarela,
+            lider,
+            true,
+            HashMap::new(),
+        )
+        .start();
         let comunicador = Comunicador::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -613,6 +803,40 @@ mod tests {
             let _ = estacion.send(alquilar(0)).await.unwrap();
             // El alquiler exitoso se reportó al registro (esta estación es el líder).
             assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn devolucion_completa_cobra_y_cierra_el_registro() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = arrancar(vec![s0], pasarela).await; // líder y origen
+
+            // Alquilar: registro queda en 1, slot 0 vacío.
+            let _ = estacion.send(alquilar(0)).await.unwrap();
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+
+            // Devolver la bici en el slot 0 (ahora vacío) → DevolucionAceptada + background.
+            let resp = estacion
+                .send(SolicitudUsuario(
+                    MensajeUsuarioAEstacion::SolicitudDevolucion {
+                        usuario_id: UsuarioId("alice".to_string()),
+                        bici_id: BiciId(42),
+                        rental_id: RentalId("ignorado".to_string()),
+                        slot_id: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::DevolucionAceptada { .. }
+            ));
+
+            // El background (ProcesarDevolucion) corre antes que esta consulta y
+            // cierra el alquiler en el registro.
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
         });
     }
 
