@@ -12,19 +12,27 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use actix::prelude::*;
-use comun::comunicador::{Comunicador, ConsultarTcp, EnviarTcp, PaqueteRecibido, Responder};
-use comun::mensajes::estacion_estacion::MensajeEntreEstacionesTCP;
+use comun::comunicador::{
+    Comunicador, ConsultarTcp, EnviarTcp, EnviarUdp, PaqueteRecibido, Responder,
+};
+use comun::mensajes::estacion_estacion::{MensajeEntreEstacionesTCP, MensajeEntreEstacionesUDP};
 use comun::mensajes::estacion_pasarela::{
     MensajeEstacionAPasarela, MensajePasarelaAEstacion, VotoResultado,
 };
 use comun::mensajes::usuario_estacion::{
     MensajeEstacionAUsuario, MensajeUsuario, MensajeUsuarioAEstacion,
 };
-use comun::{Alquiler, EstacionId, EstadoAlquiler, EventId, RentalId, Timestamp, TransaccionId};
+use comun::{
+    Alquiler, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId, Timestamp, TransaccionId,
+};
+
+/// Cada cuánto cada estación le manda su estado al líder por UDP.
+const INTERVALO_GOSSIP: std::time::Duration = std::time::Duration::from_secs(3);
 
 use crate::mensajes::{
-    AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarRegistro, PrepareLiberacion,
-    ProcesarDevolucion, RegistrarComunicador, SolicitudUsuario, Voto,
+    AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarCache, ConsultarEstado,
+    ConsultarRegistro, PrepareLiberacion, ProcesarDevolucion, RegistrarComunicador,
+    SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -38,10 +46,15 @@ struct DatosCobro {
     estacion_origen: EstacionId,
 }
 
-/// Rol de la estación: una es el líder (mantiene el registro autoritativo), el
-/// resto son followers.
+/// Rol de la estación: una es el líder (mantiene el registro autoritativo y la
+/// cache de estados para las consultas), el resto son followers.
 enum RolEstacion {
-    Lider(Registro),
+    Lider {
+        registro: Registro,
+        /// Estado agregado de cada estación, alimentado por el gossip UDP
+        /// (`EstadoEstacion`). Sirve para responder consultas de disponibilidad.
+        cache: HashMap<EstacionId, InfoEstacion>,
+    },
     Follower,
 }
 
@@ -83,7 +96,10 @@ impl Estacion {
             lider,
             estaciones,
             rol: if es_lider {
-                RolEstacion::Lider(Registro::new())
+                RolEstacion::Lider {
+                    registro: Registro::new(),
+                    cache: HashMap::new(),
+                }
             } else {
                 RolEstacion::Follower
             },
@@ -96,6 +112,47 @@ impl Estacion {
     fn proximo(&mut self) -> u64 {
         self.contador += 1;
         self.contador
+    }
+
+    /// Arma el snapshot de estado (contando bicis disponibles en los slots) y se
+    /// lo manda al líder por UDP. El conteo es asincrónico (consulta a cada slot),
+    /// así que se resuelve con un futuro spawneado en el contexto del actor.
+    fn enviar_estado(&mut self, ctx: &mut Context<Self>) {
+        let slots = self.slots.clone();
+        let id = self.id;
+        let ubicacion = self.ubicacion;
+        let lider = self.lider;
+        let total = self.slots.len() as u32;
+        let fut = async move {
+            let mut disponibles = 0u32;
+            for slot in &slots {
+                if let Ok(estado) = slot.send(ConsultarEstado).await {
+                    if estado.ocupado {
+                        disponibles += 1;
+                    }
+                }
+            }
+            disponibles
+        }
+        .into_actor(self)
+        .map(move |disponibles, act, _ctx| {
+            let estado = MensajeEntreEstacionesUDP::EstadoEstacion {
+                estacion_id: id,
+                ubicacion,
+                bicis_disponibles: disponibles,
+                slots_libres: total - disponibles,
+                timestamp: Timestamp::ahora(),
+            };
+            if let (Some(comunicador), Ok(bytes)) =
+                (&act.comunicador, comun::serializacion::a_bytes(&estado))
+            {
+                comunicador.do_send(EnviarUdp {
+                    destino: lider,
+                    datos: bytes,
+                });
+            }
+        });
+        ctx.spawn(fut);
     }
 
     /// Reporta un alquiler recién abierto al líder. Si esta estación ES el líder,
@@ -112,7 +169,7 @@ impl Estacion {
             preauth_id: alquiler.preauth_id.clone(),
         };
         match &mut self.rol {
-            RolEstacion::Lider(registro) => registro.agregar(alquiler.clone()),
+            RolEstacion::Lider { registro, .. } => registro.agregar(alquiler.clone()),
             RolEstacion::Follower => {
                 if let (Some(comunicador), Ok(bytes)) =
                     (&self.comunicador, comun::serializacion::a_bytes(&abierto))
@@ -144,7 +201,7 @@ impl Estacion {
                 preauth_id,
                 ..
             } => {
-                if let RolEstacion::Lider(registro) = &mut self.rol {
+                if let RolEstacion::Lider { registro, .. } = &mut self.rol {
                     registro.agregar(Alquiler {
                         rental_id,
                         bici_id,
@@ -161,16 +218,18 @@ impl Estacion {
                 event_id, bici_id, ..
             } => {
                 let respuesta = match &self.rol {
-                    RolEstacion::Lider(registro) => match registro.buscar_por_bici(bici_id) {
-                        Some(a) => MensajeEntreEstacionesTCP::DatosParaCobro {
-                            event_id,
-                            rental_id: a.rental_id.clone(),
-                            preauth_id: a.preauth_id.clone(),
-                            t0: a.inicio,
-                            estacion_origen: a.estacion_origen,
-                        },
-                        None => MensajeEntreEstacionesTCP::NoRegistradoAun { event_id },
-                    },
+                    RolEstacion::Lider { registro, .. } => {
+                        match registro.buscar_por_bici(bici_id) {
+                            Some(a) => MensajeEntreEstacionesTCP::DatosParaCobro {
+                                event_id,
+                                rental_id: a.rental_id.clone(),
+                                preauth_id: a.preauth_id.clone(),
+                                t0: a.inicio,
+                                estacion_origen: a.estacion_origen,
+                            },
+                            None => MensajeEntreEstacionesTCP::NoRegistradoAun { event_id },
+                        }
+                    }
                     RolEstacion::Follower => {
                         MensajeEntreEstacionesTCP::NoRegistradoAun { event_id }
                     }
@@ -181,7 +240,7 @@ impl Estacion {
                 }
             }
             MensajeEntreEstacionesTCP::DevolucionProcesada { rental_id, .. } => {
-                if let RolEstacion::Lider(registro) = &mut self.rol {
+                if let RolEstacion::Lider { registro, .. } = &mut self.rol {
                     registro.cerrar(&rental_id);
                 }
             }
@@ -223,7 +282,7 @@ struct ContextoOperacion {
 impl Actor for Estacion {
     type Context = Context<Self>;
 
-    fn started(&mut self, _ctx: &mut Self::Context) {
+    fn started(&mut self, ctx: &mut Self::Context) {
         println!(
             "[{}] actor Estacion iniciado (ubicacion {:?}, {} slots, pasarela {})",
             self.id,
@@ -231,6 +290,9 @@ impl Actor for Estacion {
             self.slots.len(),
             self.pasarela
         );
+        // Gossip: cada estación (incluido el líder, a sí mismo) le manda su estado
+        // al líder por UDP. Así el líder arma su cache para responder consultas.
+        ctx.run_interval(INTERVALO_GOSSIP, |act, ctx| act.enviar_estado(ctx));
     }
 }
 
@@ -247,7 +309,18 @@ impl Handler<ConsultarRegistro> for Estacion {
 
     fn handle(&mut self, _msg: ConsultarRegistro, _ctx: &mut Self::Context) -> usize {
         match &self.rol {
-            RolEstacion::Lider(registro) => registro.activos(),
+            RolEstacion::Lider { registro, .. } => registro.activos(),
+            RolEstacion::Follower => 0,
+        }
+    }
+}
+
+impl Handler<ConsultarCache> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarCache, _ctx: &mut Self::Context) -> usize {
+        match &self.rol {
+            RolEstacion::Lider { cache, .. } => cache.len(),
             RolEstacion::Follower => 0,
         }
     }
@@ -259,8 +332,8 @@ impl Handler<ProcesarDevolucion> for Estacion {
     fn handle(&mut self, msg: ProcesarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
         // Datos de cobro: si soy el líder los busco en mi registro (en proceso);
         // si soy follower los consulto por red (más abajo).
-        let es_lider = matches!(self.rol, RolEstacion::Lider(_));
-        let datos_si_lider = if let RolEstacion::Lider(registro) = &self.rol {
+        let es_lider = matches!(self.rol, RolEstacion::Lider { .. });
+        let datos_si_lider = if let RolEstacion::Lider { registro, .. } = &self.rol {
             registro.buscar_por_bici(msg.bici_id).map(|a| DatosCobro {
                 rental_id: a.rental_id.clone(),
                 preauth_id: a.preauth_id.clone(),
@@ -315,7 +388,7 @@ impl Handler<ProcesarDevolucion> for Estacion {
                 let tiempo = datos.t0.minutos_hasta(t1);
 
                 // Cerrar en el líder (en proceso si soy líder; por red si no).
-                if let RolEstacion::Lider(registro) = &mut actor.rol {
+                if let RolEstacion::Lider { registro, .. } = &mut actor.rol {
                     registro.cerrar(&datos.rental_id);
                 } else if let (Some(comunicador), Ok(bytes)) = (
                     &actor.comunicador,
@@ -609,6 +682,30 @@ impl Handler<PaqueteRecibido> for Estacion {
             return Box::pin(async {}.into_actor(self).map(|_, _, _| ()));
         }
 
+        // ¿Es gossip de estado (UDP)? Solo le interesa al líder, que actualiza su cache.
+        if let Ok(MensajeEntreEstacionesUDP::EstadoEstacion {
+            estacion_id,
+            ubicacion,
+            bicis_disponibles,
+            slots_libres,
+            timestamp,
+        }) = comun::serializacion::desde_bytes::<MensajeEntreEstacionesUDP>(&msg.datos)
+        {
+            if let RolEstacion::Lider { cache, .. } = &mut self.rol {
+                cache.insert(
+                    estacion_id,
+                    InfoEstacion {
+                        estacion_id,
+                        ubicacion,
+                        bicis_disponibles,
+                        slots_libres,
+                        last_seen: timestamp,
+                    },
+                );
+            }
+            return Box::pin(async {}.into_actor(self).map(|_, _, _| ()));
+        }
+
         let pedido: Option<MensajeUsuario> = comun::serializacion::desde_bytes(&msg.datos).ok();
 
         match (pedido, msg.responder) {
@@ -646,7 +743,6 @@ impl Handler<PaqueteRecibido> for Estacion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mensajes::ConsultarEstado;
     use comun::comunicador::Transporte;
     use comun::framing::{enmarcar, Desenmarcador};
     use comun::{BiciId, DatosTarjeta, UsuarioId};
@@ -659,6 +755,14 @@ mod tests {
             transporte: Transporte::Tcp,
             datos: comun::serializacion::a_bytes(msg).unwrap(),
             responder,
+        }
+    }
+
+    fn paquete_udp(msg: &MensajeEntreEstacionesUDP) -> PaqueteRecibido {
+        PaqueteRecibido {
+            transporte: Transporte::Udp,
+            datos: comun::serializacion::a_bytes(msg).unwrap(),
+            responder: None,
         }
     }
     use std::io::{Read, Write};
@@ -956,6 +1060,32 @@ mod tests {
                 ocupado.send(ConsultarEstado).await.unwrap().bici_id,
                 Some(BiciId(10))
             );
+        });
+    }
+
+    #[test]
+    fn el_lider_guarda_el_gossip_en_su_cache() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let estacion = arrancar(vec![Slot::nuevo(0).start()], pasarela).await;
+
+            // Arranca con la cache vacía.
+            assert_eq!(estacion.send(ConsultarCache).await.unwrap(), 0);
+
+            // Llega gossip de otra estación → el líder lo guarda.
+            let gossip = MensajeEntreEstacionesUDP::EstadoEstacion {
+                estacion_id: EstacionId(2),
+                ubicacion: (-34.61, -58.41),
+                bicis_disponibles: 4,
+                slots_libres: 6,
+                timestamp: Timestamp(123),
+            };
+            estacion.send(paquete_udp(&gossip)).await.unwrap();
+            assert_eq!(estacion.send(ConsultarCache).await.unwrap(), 1);
+
+            // Otro snapshot de la MISMA estación no agrega una entrada (es un upsert).
+            estacion.send(paquete_udp(&gossip)).await.unwrap();
+            assert_eq!(estacion.send(ConsultarCache).await.unwrap(), 1);
         });
     }
 }
