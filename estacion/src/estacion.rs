@@ -20,7 +20,8 @@ use comun::mensajes::estacion_pasarela::{
     MensajeEstacionAPasarela, MensajePasarelaAEstacion, VotoResultado,
 };
 use comun::mensajes::usuario_estacion::{
-    MensajeEstacionAUsuario, MensajeUsuario, MensajeUsuarioAEstacion,
+    MensajeEstacionAUsuario, MensajeEstacionAUsuarioConsulta, MensajeUsuario,
+    MensajeUsuarioAEstacion, MensajeUsuarioAEstacionConsulta,
 };
 use comun::{
     Alquiler, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId, Timestamp, TransaccionId,
@@ -68,6 +69,8 @@ pub struct Estacion {
     pasarela: SocketAddr,
     /// Dirección del líder (a quién reportar los alquileres si soy follower).
     lider: SocketAddr,
+    /// Id del líder, para responder el discovery (`PreguntarLider`).
+    lider_id: EstacionId,
     /// Direcciones de todas las estaciones, para alcanzar al origen en la devolución.
     estaciones: HashMap<EstacionId, SocketAddr>,
     rol: RolEstacion,
@@ -84,16 +87,18 @@ impl Estacion {
         ubicacion: (f64, f64),
         slots: Vec<Addr<Slot>>,
         pasarela: SocketAddr,
-        lider: SocketAddr,
+        lider: (EstacionId, SocketAddr),
         es_lider: bool,
         estaciones: HashMap<EstacionId, SocketAddr>,
     ) -> Self {
+        let (lider_id, lider) = lider;
         Self {
             id,
             ubicacion,
             slots,
             pasarela,
             lider,
+            lider_id,
             estaciones,
             rol: if es_lider {
                 RolEstacion::Lider {
@@ -179,6 +184,41 @@ impl Estacion {
                         datos: bytes,
                     });
                 }
+            }
+        }
+    }
+
+    /// Responde una consulta del usuario (CU3): discovery del líder o
+    /// disponibilidad. La disponibilidad solo la puede contestar el líder (es el
+    /// único con la cache); un follower devuelve la lista vacía.
+    fn manejar_consulta(
+        &self,
+        consulta: MensajeUsuarioAEstacionConsulta,
+    ) -> MensajeEstacionAUsuarioConsulta {
+        match consulta {
+            MensajeUsuarioAEstacionConsulta::PreguntarLider => {
+                // Líder fijo por config (sin elección todavía), así que term = 0.
+                MensajeEstacionAUsuarioConsulta::RespuestaLider {
+                    lider_id: self.lider_id,
+                    lider_addr: self.lider,
+                    term: 0,
+                }
+            }
+            MensajeUsuarioAEstacionConsulta::ConsultaDisponibilidad {
+                ubicacion,
+                radio_max_km,
+                ..
+            } => {
+                let estaciones = match &self.rol {
+                    RolEstacion::Lider { cache, .. } => cache
+                        .values()
+                        .filter(|info| info.bicis_disponibles > 0)
+                        .filter(|info| distancia_km(ubicacion, info.ubicacion) <= radio_max_km)
+                        .cloned()
+                        .collect(),
+                    RolEstacion::Follower => Vec::new(),
+                };
+                MensajeEstacionAUsuarioConsulta::RespuestaDisponibilidad { estaciones }
             }
         }
     }
@@ -277,6 +317,18 @@ struct ContextoOperacion {
     estacion_origen: EstacionId,
     pasarela: SocketAddr,
     comunicador: Option<Addr<Comunicador>>,
+}
+
+/// Distancia aproximada en km entre dos puntos `(lat, lon)` en grados, con la
+/// fórmula equirectangular (suficiente para distancias urbanas y mucho más barata
+/// que la de Haversine). No usamos crates externas: solo `f64` de la std.
+fn distancia_km(a: (f64, f64), b: (f64, f64)) -> f64 {
+    const R_TIERRA_KM: f64 = 6371.0;
+    let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians());
+    let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians());
+    let x = (lon2 - lon1) * ((lat1 + lat2) / 2.0).cos();
+    let y = lat2 - lat1;
+    R_TIERRA_KM * (x * x + y * y).sqrt()
 }
 
 impl Actor for Estacion {
@@ -709,6 +761,13 @@ impl Handler<PaqueteRecibido> for Estacion {
         let pedido: Option<MensajeUsuario> = comun::serializacion::desde_bytes(&msg.datos).ok();
 
         match (pedido, msg.responder) {
+            (Some(MensajeUsuario::Consulta(consulta)), Some(responder)) => {
+                let respuesta = self.manejar_consulta(consulta);
+                if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
+                    responder.responder(bytes);
+                }
+                Box::pin(async {}.into_actor(self).map(|_, _, _| ()))
+            }
             (Some(MensajeUsuario::Operacion(operacion)), Some(responder)) => {
                 let ctx = self.contexto();
                 Box::pin(
@@ -794,7 +853,7 @@ mod tests {
             (0.0, 0.0),
             slots,
             pasarela,
-            lider,
+            (EstacionId(1), lider),
             true,
             HashMap::new(),
         )
@@ -1086,6 +1145,85 @@ mod tests {
             // Otro snapshot de la MISMA estación no agrega una entrada (es un upsert).
             estacion.send(paquete_udp(&gossip)).await.unwrap();
             assert_eq!(estacion.send(ConsultarCache).await.unwrap(), 1);
+        });
+    }
+
+    /// Gossip de una estación con `bicis` bicis en `ubicacion`.
+    fn gossip(id: u32, ubicacion: (f64, f64), bicis: u32) -> PaqueteRecibido {
+        paquete_udp(&MensajeEntreEstacionesUDP::EstadoEstacion {
+            estacion_id: EstacionId(id),
+            ubicacion,
+            bicis_disponibles: bicis,
+            slots_libres: 10 - bicis,
+            timestamp: Timestamp(0),
+        })
+    }
+
+    /// Manda una consulta a la estación (vía `PaqueteRecibido` con responder) y
+    /// devuelve la respuesta tipada.
+    async fn consultar(
+        estacion: &Addr<Estacion>,
+        consulta: MensajeUsuarioAEstacionConsulta,
+    ) -> MensajeEstacionAUsuarioConsulta {
+        let (resp, rx) = Responder::canal();
+        let datos = comun::serializacion::a_bytes(&MensajeUsuario::Consulta(consulta)).unwrap();
+        estacion
+            .send(PaqueteRecibido {
+                transporte: Transporte::Tcp,
+                datos,
+                responder: Some(resp),
+            })
+            .await
+            .unwrap();
+        comun::serializacion::desde_bytes(&rx.recv().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn discovery_devuelve_al_lider() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let estacion = arrancar(vec![Slot::nuevo(0).start()], pasarela).await;
+
+            let resp = consultar(&estacion, MensajeUsuarioAEstacionConsulta::PreguntarLider).await;
+            match resp {
+                MensajeEstacionAUsuarioConsulta::RespuestaLider { lider_id, .. } => {
+                    assert_eq!(lider_id, EstacionId(1));
+                }
+                otra => panic!("esperaba RespuestaLider, fue {otra:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn consulta_de_disponibilidad_filtra_por_proximidad_y_por_bicis() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let estacion = arrancar(vec![Slot::nuevo(0).start()], pasarela).await;
+
+            // Cargamos la cache con tres estaciones cerca de Buenos Aires:
+            //  - 2: cerca, con bicis  → debe aparecer
+            //  - 3: cerca, sin bicis  → se filtra (no sirve para alquilar)
+            //  - 4: lejos (La Plata), con bicis → se filtra por distancia
+            estacion.send(gossip(2, (-34.60, -58.40), 5)).await.unwrap();
+            estacion.send(gossip(3, (-34.61, -58.41), 0)).await.unwrap();
+            estacion.send(gossip(4, (-34.92, -57.95), 5)).await.unwrap();
+
+            let resp = consultar(
+                &estacion,
+                MensajeUsuarioAEstacionConsulta::ConsultaDisponibilidad {
+                    usuario_id: UsuarioId("alice".to_string()),
+                    ubicacion: (-34.60, -58.40),
+                    radio_max_km: 5.0,
+                },
+            )
+            .await;
+            match resp {
+                MensajeEstacionAUsuarioConsulta::RespuestaDisponibilidad { estaciones } => {
+                    let ids: Vec<u32> = estaciones.iter().map(|e| e.estacion_id.0).collect();
+                    assert_eq!(ids, vec![2], "solo la 2 está cerca y con bicis");
+                }
+                otra => panic!("esperaba RespuestaDisponibilidad, fue {otra:?}"),
+            }
         });
     }
 }
