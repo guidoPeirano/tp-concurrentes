@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             mi_config.ubicacion,
             slots,
             pasarela_addr,
-            lider_addr,
+            (config.lider, lider_addr),
             es_lider,
             estaciones,
         )

@@ -229,3 +229,91 @@ fn alquilar_en_una_estacion_y_devolver_en_otra() {
         "el estado final debería ser SinBici. salida:\n{salida}"
     );
 }
+
+/// Config de dos estaciones (1 = líder) + pasarela, en puertos propios para el
+/// test de consulta de disponibilidad (CU3).
+fn escribir_config_consulta() -> PathBuf {
+    let ruta = std::env::temp_dir().join(format!("tp_e2e_consulta_{}.json", std::process::id()));
+    let contenido = r#"{
+  "estaciones": [
+    { "id": 1, "puerto": 18931, "ubicacion": [-34.60, -58.40] },
+    { "id": 2, "puerto": 18932, "ubicacion": [-34.61, -58.41] }
+  ],
+  "pasarela": { "puerto": 19031 },
+  "tarifa": { "base": 50.0, "por_minuto": 10.0 },
+  "lider": 1
+}"#;
+    std::fs::write(&ruta, contenido).expect("escribir config temporal");
+    ruta
+}
+
+#[test]
+fn consulta_de_disponibilidad_por_la_repl() {
+    let config = escribir_config_consulta();
+    let config = config.to_str().unwrap();
+
+    let _pasarela = Proceso(
+        Command::new(bin("pasarela"))
+            .args(["--puerto", "19031", "--config", config])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pasarela"),
+    );
+    let _estacion1 = Proceso(
+        Command::new(bin("estacion"))
+            .args(["--id", "1", "--puerto", "18931", "--config", config])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn estacion 1"),
+    );
+    let _estacion2 = Proceso(
+        Command::new(bin("estacion"))
+            .args(["--id", "2", "--puerto", "18932", "--config", config])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn estacion 2"),
+    );
+    esperar_puerto(19031);
+    esperar_puerto(18931);
+    esperar_puerto(18932);
+
+    // Las dos estaciones gossipean su estado al líder cada 3s; esperamos una ronda
+    // para que la cache del líder se pueble antes de consultar.
+    std::thread::sleep(Duration::from_millis(4000));
+
+    // Consulta cerca de ambas estaciones (radio 5 km): las dos tienen bicis.
+    let mut usuario = Command::new(bin("usuario"))
+        .args(["--id", "carol", "--config", config])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn usuario");
+    let comandos = "\
+        consultar -34.60 -58.40 5\n\
+        salir\n";
+    usuario
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(comandos.as_bytes())
+        .expect("escribir comandos");
+    let mut salida = String::new();
+    usuario
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut salida)
+        .expect("leer salida");
+    usuario.wait().expect("esperar usuario");
+
+    assert!(
+        salida.contains("estaciones con bici cerca"),
+        "salida:\n{salida}"
+    );
+    // Ambas estaciones (incluido el líder, que se gossipea a sí mismo) deben aparecer.
+    assert!(salida.contains("estación 1"), "salida:\n{salida}");
+    assert!(salida.contains("estación 2"), "salida:\n{salida}");
+}
