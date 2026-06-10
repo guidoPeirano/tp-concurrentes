@@ -37,6 +37,12 @@ pub struct RegistrarComunicador(pub Addr<Comunicador>);
 #[rtype(result = "usize")]
 pub struct ConsultarRegistro;
 
+/// Consulta de diagnóstico: cuántas estaciones tiene el líder en su cache de
+/// estados (alimentada por el gossip UDP). Devuelve 0 si no es el líder.
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarCache;
+
 /// Fase Prepare del 2PC sobre el `Slot`: pide reservar la bici para una
 /// transacción. Responde con el voto.
 #[derive(Message)]
