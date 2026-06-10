@@ -23,18 +23,15 @@ impl Registro {
         self.alquileres.insert(alquiler.rental_id.clone(), alquiler);
     }
 
-    /// Busca el alquiler **activo** de una bicicleta. Lo usa el flujo de devolución
-    /// (Etapa 4b); por eso todavía no se llama desde el binario.
-    #[allow(dead_code)]
+    /// Busca el alquiler **activo** de una bicicleta (lo usa la devolución para
+    /// armar los datos de cobro).
     pub fn buscar_por_bici(&self, bici_id: BiciId) -> Option<&Alquiler> {
         self.alquileres
             .values()
             .find(|a| a.bici_id == bici_id && a.estado == EstadoAlquiler::Activo)
     }
 
-    /// Marca un alquiler como cerrado. Devuelve `true` si existía. Lo usa la
-    /// devolución (Etapa 4b).
-    #[allow(dead_code)]
+    /// Marca un alquiler como cerrado. Devuelve `true` si existía.
     pub fn cerrar(&mut self, rental_id: &RentalId) -> bool {
         match self.alquileres.get_mut(rental_id) {
             Some(a) => {
