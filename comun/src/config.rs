@@ -7,6 +7,7 @@
 //! extra, para respetar la restricción de dependencias del enunciado.
 
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,9 @@ pub struct Config {
     pub estaciones: Vec<EstacionConfig>,
     pub pasarela: PasarelaConfig,
     pub tarifa: TarifaConfig,
+    /// Id de la estación que arranca como líder (sin elección todavía; en la
+    /// Etapa 5 esto lo decide el algoritmo Ring).
+    pub lider: EstacionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,6 +54,12 @@ impl Config {
     pub fn estacion(&self, id: EstacionId) -> Option<&EstacionConfig> {
         self.estaciones.iter().find(|e| e.id == id)
     }
+
+    /// Dirección TCP del líder designado por config.
+    pub fn direccion_lider(&self) -> Option<SocketAddr> {
+        let lider = self.estacion(self.lider)?;
+        Some(SocketAddr::from(([127, 0, 0, 1], lider.puerto)))
+    }
 }
 
 #[cfg(test)]
@@ -64,7 +74,8 @@ mod tests {
         { "id": 3, "puerto": 8003, "ubicacion": [-34.6200, -58.3900] }
       ],
       "pasarela": { "puerto": 9000 },
-      "tarifa": { "base": 50.0, "por_minuto": 10.0 }
+      "tarifa": { "base": 50.0, "por_minuto": 10.0 },
+      "lider": 1
     }
     "#;
 
@@ -79,6 +90,7 @@ mod tests {
         assert_eq!(config.pasarela.puerto, 9000);
         assert_eq!(config.tarifa.base, 50.0);
         assert_eq!(config.tarifa.por_minuto, 10.0);
+        assert_eq!(config.lider, EstacionId(1));
     }
 
     #[test]
@@ -86,5 +98,14 @@ mod tests {
         let config: Config = serde_json::from_str(EJEMPLO).unwrap();
         assert_eq!(config.estacion(EstacionId(2)).unwrap().puerto, 8002);
         assert!(config.estacion(EstacionId(99)).is_none());
+    }
+
+    #[test]
+    fn direccion_del_lider() {
+        let config: Config = serde_json::from_str(EJEMPLO).unwrap();
+        assert_eq!(
+            config.direccion_lider().unwrap(),
+            "127.0.0.1:8001".parse().unwrap()
+        );
     }
 }

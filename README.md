@@ -1172,11 +1172,12 @@ Cada proceso lee input por consola para simular las acciones (acercarse a un slo
     { "id": 3, "puerto": 8003, "ubicacion": [-34.6200, -58.3900] }
   ],
   "pasarela": { "puerto": 9000 },
-  "tarifa": { "base": 50.0, "por_minuto": 10.0 }
+  "tarifa": { "base": 50.0, "por_minuto": 10.0 },
+  "lider": 1
 }
 ```
 
-Usamos JSON (no TOML) para no depender de una crate extra de parsing, respetando la restricción de dependencias del enunciado. El anillo lógico para Ring se construye por orden de `EstacionId`. El mismo archivo lo usan los tres binarios: la estación toma su entrada por `--id`, la pasarela usa `pasarela` y `tarifa`, y el usuario usa la lista de estaciones para descubrir al líder.
+Usamos JSON (no TOML) para no depender de una crate extra de parsing, respetando la restricción de dependencias del enunciado. El campo `lider` designa la estación que arranca como líder (en la Etapa de elección esto pasa a decidirlo el algoritmo Ring). El mismo archivo lo usan los tres binarios: la estación toma su entrada por `--id`, la pasarela usa `pasarela` y `tarifa`, y el usuario usa la lista de estaciones para descubrir al líder.
 
 ---
 

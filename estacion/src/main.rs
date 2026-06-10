@@ -4,6 +4,7 @@
 
 mod estacion;
 mod mensajes;
+mod registro;
 mod slot;
 
 use std::error::Error;
@@ -46,6 +47,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let addr_red = SocketAddr::from(([127, 0, 0, 1], puerto));
     // Dirección de la pasarela, para el 2PC de alquiler.
     let pasarela_addr = SocketAddr::from(([127, 0, 0, 1], config.pasarela.puerto));
+    // Líder designado por config (sin elección todavía).
+    let lider_addr = config
+        .direccion_lider()
+        .ok_or("el líder de la config no está en la lista de estaciones")?;
+    let es_lider = id == config.lider;
 
     let system = System::new();
     let _actores = system.block_on(async move {
@@ -61,7 +67,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect();
         // La Estacion toma posesión de los slots (mantiene vivas sus Addr).
-        let estacion = Estacion::new(id, mi_config.ubicacion, slots, pasarela_addr).start();
+        let estacion = Estacion::new(
+            id,
+            mi_config.ubicacion,
+            slots,
+            pasarela_addr,
+            lider_addr,
+            es_lider,
+        )
+        .start();
         let comunicador =
             Comunicador::new(addr_red, addr_red, estacion.clone().recipient()).start();
         // Le damos a la estación la Addr de su Comunicador (para hablar con la pasarela).
