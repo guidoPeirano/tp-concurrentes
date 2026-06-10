@@ -125,6 +125,9 @@ fn flujo_completo_por_la_repl() {
     // El slot 0 tiene bici → alquiler OK, el usuario queda ConBici.
     assert!(salida.contains("AlquilerConfirmado"), "salida:\n{salida}");
     assert!(salida.contains("ConBici"), "salida:\n{salida}");
+    // La pre-autorización la dio la pasarela (id "P-...", no el "local" provisorio):
+    // confirma que el alquiler hizo el 2PC contra la pasarela de verdad.
+    assert!(salida.contains("preauth_id: \"P-"), "salida:\n{salida}");
     // Con una bici en mano, un segundo alquiler lo bloquea el propio cliente.
     assert!(salida.contains("ya tenés"), "salida:\n{salida}");
     // Devolver al slot 1 (ocupado) se rechaza; al slot 0 (vacío) se acepta.

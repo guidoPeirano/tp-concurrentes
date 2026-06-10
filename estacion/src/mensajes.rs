@@ -2,6 +2,7 @@
 //! No viajan por la red, así que no están en la crate `comun`.
 
 use actix::prelude::*;
+use comun::comunicador::Comunicador;
 use comun::mensajes::usuario_estacion::{MensajeEstacionAUsuario, MensajeUsuarioAEstacion};
 use comun::{BiciId, TransaccionId};
 
@@ -12,6 +13,13 @@ use comun::{BiciId, TransaccionId};
 #[derive(Message)]
 #[rtype(result = "MensajeEstacionAUsuario")]
 pub struct SolicitudUsuario(pub MensajeUsuarioAEstacion);
+
+/// Le da a la `Estacion` la `Addr` de su `Comunicador` (se cablea al arrancar,
+/// porque el Comunicador se crea después de la Estacion). Así la estación le pide
+/// al Comunicador que hable con la pasarela, sin tocar sockets ella misma.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct RegistrarComunicador(pub Addr<Comunicador>);
 
 /// Fase Prepare del 2PC sobre el `Slot`: pide reservar la bici para una
 /// transacción. Responde con el voto.
