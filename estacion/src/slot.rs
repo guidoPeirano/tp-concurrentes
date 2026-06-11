@@ -69,6 +69,11 @@ impl Handler<PrepareLiberacion> for Slot {
     type Result = MessageResult<PrepareLiberacion>;
 
     fn handle(&mut self, msg: PrepareLiberacion, ctx: &mut Self::Context) -> Self::Result {
+        // Caso D: un Prepare repetido de la MISMA tx (reintento del coordinador)
+        // recibe la misma respuesta, sin re-procesar.
+        if self.reservado_para.as_ref() == Some(&msg.tx_id) {
+            return MessageResult(Voto::Si);
+        }
         // Vota Sí solo si tiene una bici y no está ya reservado para otra tx.
         let voto = if self.bici.is_some() && self.reservado_para.is_none() {
             self.reservado_para = Some(msg.tx_id.clone());
@@ -230,6 +235,30 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(voto, Voto::Si);
+        });
+    }
+
+    #[test]
+    fn prepare_repetido_de_la_misma_tx_vota_si_de_nuevo() {
+        System::new().block_on(async {
+            let slot = Slot::con_bici(0, BiciId(5)).start();
+            let v1 = slot
+                .send(PrepareLiberacion { tx_id: tx("T1") })
+                .await
+                .unwrap();
+            // Reintento del coordinador (mensaje duplicado): misma respuesta.
+            let v2 = slot
+                .send(PrepareLiberacion { tx_id: tx("T1") })
+                .await
+                .unwrap();
+            assert_eq!((v1, v2), (Voto::Si, Voto::Si));
+
+            // Y la reserva sigue siendo una sola: otra tx vota No.
+            let v3 = slot
+                .send(PrepareLiberacion { tx_id: tx("T2") })
+                .await
+                .unwrap();
+            assert_eq!(v3, Voto::No);
         });
     }
 

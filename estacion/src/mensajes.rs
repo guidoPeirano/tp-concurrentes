@@ -49,6 +49,12 @@ pub struct ConsultarCache;
 #[rtype(result = "InfoLider")]
 pub struct ConsultarLider;
 
+/// Consulta de diagnóstico: cuántos eventos al líder esperan en la cola de
+/// diferidos (no se pudieron entregar todavía).
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarPendientes;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InfoLider {
     /// `None` si hay una elección en curso o todavía no se conoce al líder.

@@ -8,7 +8,7 @@
 //! Toda la red pasa por el `Comunicador`: para hablarle a la pasarela, la estación
 //! le manda `ConsultarTcp` a su Comunicador (no toca sockets ella misma).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use actix::prelude::*;
@@ -45,11 +45,19 @@ const UMBRAL_ELECCION_TRABADA: u8 = 5;
 /// como No implícito (Caso A de la sección 7.1.1 del README).
 const TIMEOUT_PREPARE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Intentos de `NotificarDevolucion` al líder antes de dar a la bici por
+/// huérfana (el líder pudo responder `NoRegistradoAun` si el reporte del origen
+/// todavía no le llegó).
+const REINTENTOS_NOTIFICACION: u32 = 4;
+
+/// Espera base entre reintentos de `NotificarDevolucion` (crece linealmente).
+const ESPERA_REINTENTO: std::time::Duration = std::time::Duration::from_millis(500);
+
 use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarCache, ConsultarEstado,
-    ConsultarLider, ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion,
-    RegistrarComunicador, SolicitudUsuario, Voto,
+    ConsultarLider, ConsultarPendientes, ConsultarRegistro, InfoLider, PrepareLiberacion,
+    ProcesarDevolucion, RegistrarComunicador, SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -71,8 +79,24 @@ enum RolEstacion {
         /// Estado agregado de cada estación, alimentado por el gossip UDP
         /// (`EstadoEstacion`). Sirve para responder consultas de disponibilidad.
         cache: HashMap<EstacionId, InfoEstacion>,
+        /// Eventos ya procesados (Caso D): un reintento con el mismo `event_id`
+        /// no se vuelve a aplicar. Importa con la cola de diferidos: un evento
+        /// puede llegar dos veces si el ACK de TCP se perdió y se reenvió.
+        eventos: HashSet<EventId>,
     },
     Follower,
+}
+
+impl RolEstacion {
+    /// Rol líder recién asumido: registro, cache y dedup arrancan vacíos (el
+    /// registro se puebla con la reconstrucción).
+    fn lider_nuevo() -> Self {
+        RolEstacion::Lider {
+            registro: Registro::new(),
+            cache: HashMap::new(),
+            eventos: HashSet::new(),
+        }
+    }
 }
 
 /// Monto que se pre-autoriza (reserva) al iniciar un alquiler. Provisorio fijo.
@@ -102,6 +126,9 @@ pub struct Estacion {
     fallos_lider: u8,
     /// Intervalos de vigilancia transcurridos con la elección sin resolver.
     intervalos_en_eleccion: u8,
+    /// Cola de diferidos: eventos al líder que no se pudieron entregar. Se
+    /// reintentan cuando el líder vuelve a responder (o tras una elección).
+    eventos_pendientes: Vec<MensajeEntreEstacionesTCP>,
 }
 
 impl Estacion {
@@ -125,10 +152,7 @@ impl Estacion {
             lider_id,
             estaciones,
             rol: if es_lider {
-                RolEstacion::Lider {
-                    registro: Registro::new(),
-                    cache: HashMap::new(),
-                }
+                RolEstacion::lider_nuevo()
             } else {
                 RolEstacion::Follower
             },
@@ -138,6 +162,7 @@ impl Estacion {
             contador: 0,
             fallos_lider: 0,
             intervalos_en_eleccion: 0,
+            eventos_pendientes: Vec::new(),
         }
     }
 
@@ -188,8 +213,9 @@ impl Estacion {
     }
 
     /// Reporta un alquiler recién abierto al líder. Si esta estación ES el líder,
-    /// lo registra directo; si es follower, se lo manda por el Comunicador.
-    fn reportar_alquiler(&mut self, alquiler: &Alquiler) {
+    /// lo registra directo; si es follower, se lo manda por el Comunicador (con
+    /// cola de diferidos si el líder no está disponible).
+    fn reportar_alquiler(&mut self, alquiler: &Alquiler, ctx: &mut Context<Self>) {
         let n = self.proximo();
         let abierto = MensajeEntreEstacionesTCP::AlquilerAbierto {
             event_id: EventId(format!("E-{}-{}", self.id.0, n)),
@@ -202,15 +228,66 @@ impl Estacion {
         };
         match &mut self.rol {
             RolEstacion::Lider { registro, .. } => registro.agregar(alquiler.clone()),
-            RolEstacion::Follower => {
-                if let (Some(comunicador), Ok(bytes)) =
-                    (&self.comunicador, comun::serializacion::a_bytes(&abierto))
-                {
-                    comunicador.do_send(EnviarTcp {
-                        destino: self.lider,
-                        datos: bytes,
-                    });
-                }
+            RolEstacion::Follower => self.enviar_evento_al_lider(abierto, ctx),
+        }
+    }
+
+    /// Manda un evento al líder con confirmación de entrega: si no se pudo (el
+    /// líder está caído o en elección), el evento queda en la cola de diferidos
+    /// y se reintenta cuando el líder vuelva a estar disponible. El `event_id`
+    /// del evento hace que un doble envío sea inofensivo (el líder deduplica).
+    fn enviar_evento_al_lider(
+        &mut self,
+        evento: MensajeEntreEstacionesTCP,
+        ctx: &mut Context<Self>,
+    ) {
+        let (Some(comunicador), Ok(bytes)) = (
+            self.comunicador.clone(),
+            comun::serializacion::a_bytes(&evento),
+        ) else {
+            self.eventos_pendientes.push(evento);
+            return;
+        };
+        let destino = self.lider;
+        let fut = async move {
+            comunicador
+                .send(EnviarTcpConfirmado {
+                    destino,
+                    datos: bytes,
+                })
+                .await
+                .unwrap_or(false)
+        }
+        .into_actor(self)
+        .map(move |entregado, actor, _ctx| {
+            if !entregado {
+                println!(
+                    "[{}] el líder no recibe eventos: lo dejo en la cola de diferidos",
+                    actor.id
+                );
+                actor.eventos_pendientes.push(evento);
+            }
+        });
+        ctx.spawn(fut);
+    }
+
+    /// Reintenta los eventos diferidos. Si mientras tanto esta estación pasó a
+    /// ser el líder, se los aplica a sí misma (directo al registro).
+    fn descargar_pendientes(&mut self, ctx: &mut Context<Self>) {
+        if self.eventos_pendientes.is_empty() {
+            return;
+        }
+        let pendientes = std::mem::take(&mut self.eventos_pendientes);
+        println!(
+            "[{}] reintento {} eventos diferidos al líder",
+            self.id,
+            pendientes.len()
+        );
+        for evento in pendientes {
+            if matches!(self.rol, RolEstacion::Lider { .. }) {
+                self.manejar_entre_estaciones(evento, None, ctx);
+            } else {
+                self.enviar_evento_al_lider(evento, ctx);
             }
         }
     }
@@ -264,25 +341,31 @@ impl Estacion {
     ) {
         match msg {
             MensajeEntreEstacionesTCP::AlquilerAbierto {
+                event_id,
                 rental_id,
                 bici_id,
                 usuario_id,
                 estacion_origen,
                 t0,
                 preauth_id,
-                ..
             } => {
-                if let RolEstacion::Lider { registro, .. } = &mut self.rol {
-                    registro.agregar(Alquiler {
-                        rental_id,
-                        bici_id,
-                        usuario_id,
-                        estacion_origen,
-                        inicio: t0,
-                        fin: None,
-                        preauth_id,
-                        estado: EstadoAlquiler::Activo,
-                    });
+                if let RolEstacion::Lider {
+                    registro, eventos, ..
+                } = &mut self.rol
+                {
+                    // Caso D: un evento repetido (reintento) no se vuelve a aplicar.
+                    if eventos.insert(event_id) {
+                        registro.agregar(Alquiler {
+                            rental_id,
+                            bici_id,
+                            usuario_id,
+                            estacion_origen,
+                            inicio: t0,
+                            fin: None,
+                            preauth_id,
+                            estado: EstadoAlquiler::Activo,
+                        });
+                    }
                 }
             }
             MensajeEntreEstacionesTCP::NotificarDevolucion {
@@ -310,9 +393,19 @@ impl Estacion {
                     r.responder(bytes);
                 }
             }
-            MensajeEntreEstacionesTCP::DevolucionProcesada { rental_id, .. } => {
-                if let RolEstacion::Lider { registro, .. } = &mut self.rol {
-                    registro.cerrar(&rental_id);
+            MensajeEntreEstacionesTCP::DevolucionProcesada {
+                event_id,
+                rental_id,
+                ..
+            } => {
+                if let RolEstacion::Lider {
+                    registro, eventos, ..
+                } = &mut self.rol
+                {
+                    // Caso D: dedup por event_id, igual que AlquilerAbierto.
+                    if eventos.insert(event_id) {
+                        registro.cerrar(&rental_id);
+                    }
                 }
             }
             MensajeEntreEstacionesTCP::CierreAlquiler { rental_id, .. } => {
@@ -430,15 +523,14 @@ impl Estacion {
                 self.id,
                 self.eleccion.term()
             );
-            self.rol = RolEstacion::Lider {
-                registro: Registro::new(),
-                cache: HashMap::new(),
-            };
+            self.rol = RolEstacion::lider_nuevo();
             self.reconstruir_registro(ctx);
         } else if !soy_lider && era_lider {
             println!("[{}] dejo de ser líder: ahora lidera {}", self.id, lider_id);
             self.rol = RolEstacion::Follower;
         }
+        // Con líder conocido (sea quien sea), los eventos diferidos se reintentan.
+        self.descargar_pendientes(ctx);
     }
 
     /// Reconstruye el registro del líder recién electo: arranca con los alquileres
@@ -544,6 +636,9 @@ impl Estacion {
             .map(|vivo, actor, ctx| {
                 if vivo {
                     actor.fallos_lider = 0;
+                    // El líder responde: si quedaron eventos diferidos (p.ej. de
+                    // un corte transitorio), este es el momento de reenviarlos.
+                    actor.descargar_pendientes(ctx);
                     return;
                 }
                 actor.fallos_lider += 1;
@@ -645,6 +740,14 @@ impl Handler<ConsultarCache> for Estacion {
     }
 }
 
+impl Handler<ConsultarPendientes> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarPendientes, _ctx: &mut Self::Context) -> usize {
+        self.eventos_pendientes.len()
+    }
+}
+
 impl Handler<ConsultarLider> for Estacion {
     type Result = MessageResult<ConsultarLider>;
 
@@ -692,15 +795,28 @@ impl Handler<ProcesarDevolucion> for Estacion {
                 let datos = if es_lider {
                     datos_si_lider
                 } else {
-                    consultar_lider_devolucion(
-                        &comunicador,
-                        lider,
-                        event_id.clone(),
-                        bici_id,
-                        mi_id,
-                        t1,
-                    )
-                    .await
+                    // El líder puede no tener el alquiler todavía (el reporte del
+                    // origen viaja en paralelo): ante NoRegistradoAun (o un fallo
+                    // de red) se reintenta con una espera creciente.
+                    let mut datos = None;
+                    for intento in 0..REINTENTOS_NOTIFICACION {
+                        if intento > 0 {
+                            actix::clock::sleep(ESPERA_REINTENTO * intento).await;
+                        }
+                        datos = consultar_lider_devolucion(
+                            &comunicador,
+                            lider,
+                            event_id.clone(),
+                            bici_id,
+                            mi_id,
+                            t1,
+                        )
+                        .await;
+                        if datos.is_some() {
+                            break;
+                        }
+                    }
+                    datos
                 };
                 let datos = datos?;
                 // Cobro a la pasarela (proporcional a t1 - t0).
@@ -716,30 +832,26 @@ impl Handler<ProcesarDevolucion> for Estacion {
                 Some((datos, monto, event_id))
             }
             .into_actor(self)
-            .map(move |resultado, actor, _ctx| {
+            .map(move |resultado, actor, ctx| {
                 let Some((datos, monto, event_id)) = resultado else {
-                    return; // NoRegistradoAun / huérfana: se maneja en la Etapa 6.
+                    return; // Agotados los reintentos: bici huérfana (PR de la 8.2.1).
                 };
                 let tiempo = datos.t0.minutos_hasta(t1);
 
-                // Cerrar en el líder (en proceso si soy líder; por red si no).
+                // Cerrar en el líder (en proceso si soy líder; por red si no, con
+                // cola de diferidos si no está disponible).
                 if let RolEstacion::Lider { registro, .. } = &mut actor.rol {
                     registro.cerrar(&datos.rental_id);
-                } else if let (Some(comunicador), Ok(bytes)) = (
-                    &actor.comunicador,
-                    comun::serializacion::a_bytes(
-                        &MensajeEntreEstacionesTCP::DevolucionProcesada {
+                } else {
+                    actor.enviar_evento_al_lider(
+                        MensajeEntreEstacionesTCP::DevolucionProcesada {
                             event_id,
                             rental_id: datos.rental_id.clone(),
                             monto_cobrado: monto,
                             tiempo_uso_minutos: tiempo,
                         },
-                    ),
-                ) {
-                    comunicador.do_send(EnviarTcp {
-                        destino: actor.lider,
-                        datos: bytes,
-                    });
+                        ctx,
+                    );
                 }
 
                 // Cerrar en el origen (en proceso si el origen soy yo; por red si no).
@@ -1032,7 +1144,7 @@ impl Handler<SolicitudUsuario> for Estacion {
                 .into_actor(self)
                 .map(|(respuesta, alquiler), actor, ctx| {
                     if let Some(a) = alquiler {
-                        actor.reportar_alquiler(&a);
+                        actor.reportar_alquiler(&a, ctx);
                         actor.alquileres_propios.insert(a.rental_id.clone(), a);
                     }
                     if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta {
@@ -1103,7 +1215,7 @@ impl Handler<PaqueteRecibido> for Estacion {
                     .into_actor(self)
                     .map(|(respuesta, alquiler, responder), actor, ctx| {
                         if let Some(a) = alquiler {
-                            actor.reportar_alquiler(&a);
+                            actor.reportar_alquiler(&a, ctx);
                             actor.alquileres_propios.insert(a.rental_id.clone(), a);
                         }
                         if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta
@@ -1597,6 +1709,242 @@ mod tests {
                     assert_eq!(ids, vec![2], "solo la 2 está cerca y con bicis");
                 }
                 otra => panic!("esperaba RespuestaDisponibilidad, fue {otra:?}"),
+            }
+        });
+    }
+
+    fn alquiler_abierto(event: &str, rental: &str, bici: u32) -> MensajeEntreEstacionesTCP {
+        MensajeEntreEstacionesTCP::AlquilerAbierto {
+            event_id: EventId(event.to_string()),
+            rental_id: RentalId(rental.to_string()),
+            bici_id: BiciId(bici),
+            usuario_id: UsuarioId("alice".to_string()),
+            estacion_origen: EstacionId(2),
+            t0: Timestamp(0),
+            preauth_id: "P-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn el_lider_ignora_un_evento_duplicado() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let estacion = arrancar(vec![], pasarela).await; // líder
+
+            // Primer reporte: se registra.
+            estacion
+                .send(paquete_tcp(&alquiler_abierto("E1", "R1", 1), None))
+                .await
+                .unwrap();
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+
+            // El MISMO event_id otra vez (reintento de la cola de diferidos):
+            // no se aplica, aunque el contenido difiera.
+            estacion
+                .send(paquete_tcp(&alquiler_abierto("E1", "R2", 2), None))
+                .await
+                .unwrap();
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+
+            // Un evento nuevo sí entra.
+            estacion
+                .send(paquete_tcp(&alquiler_abierto("E2", "R2", 2), None))
+                .await
+                .unwrap();
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn los_eventos_al_lider_caido_se_difieren_y_se_aplican_al_asumir() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            // Follower con el líder (9) muerto desde el arranque.
+            let muerto: SocketAddr = "127.0.0.1:19039".parse().unwrap();
+            let estaciones: HashMap<EstacionId, SocketAddr> =
+                [(EstacionId(9), muerto)].into_iter().collect();
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = Estacion::new(
+                EstacionId(1),
+                (0.0, 0.0),
+                vec![s0],
+                pasarela,
+                (EstacionId(9), muerto),
+                false,
+                estaciones,
+            )
+            .start();
+            let comunicador = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                estacion.clone().recipient(),
+            )
+            .start();
+            estacion
+                .send(RegistrarComunicador(comunicador))
+                .await
+                .unwrap();
+
+            // El alquiler sale bien (la pasarela está viva), pero el reporte al
+            // líder muerto falla y queda diferido.
+            let resp = estacion.send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::AlquilerConfirmado { .. }
+            ));
+            actix::clock::sleep(std::time::Duration::from_millis(600)).await;
+            assert_eq!(
+                estacion.send(ConsultarPendientes).await.unwrap(),
+                1,
+                "el AlquilerAbierto quedó en la cola de diferidos"
+            );
+
+            // Llega un Coordinator que me nombra líder: descargo la cola sobre
+            // mi propio registro.
+            estacion
+                .send(paquete_tcp(
+                    &MensajeEntreEstacionesTCP::Coordinator {
+                        lider: EstacionId(1),
+                        term: 1,
+                    },
+                    None,
+                ))
+                .await
+                .unwrap();
+            actix::clock::sleep(std::time::Duration::from_millis(600)).await;
+            assert_eq!(estacion.send(ConsultarPendientes).await.unwrap(), 0);
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+        });
+    }
+
+    /// Líder de mentira con guion: al primer `NotificarDevolucion` responde
+    /// `NoRegistradoAun` (el reporte del origen "todavía no llegó"), al segundo
+    /// entrega los datos de cobro. Todo evento sin respuesta (p.ej.
+    /// `DevolucionProcesada`) se vuelca al canal para que el test lo verifique.
+    /// También contesta el sondeo de la vigilancia para no disparar elecciones.
+    fn lider_mock() -> (
+        SocketAddr,
+        std::sync::mpsc::Receiver<MensajeEntreEstacionesTCP>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut notificaciones = 0u32;
+            for conexion in listener.incoming() {
+                let Ok(mut stream) = conexion else { continue };
+                let mut desen = Desenmarcador::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    desen.alimentar(&buf[..n]);
+                    while let Some(payload) = desen.siguiente_payload() {
+                        if let Ok(msg) =
+                            comun::serializacion::desde_bytes::<MensajeEntreEstacionesTCP>(&payload)
+                        {
+                            match msg {
+                                MensajeEntreEstacionesTCP::NotificarDevolucion {
+                                    event_id, ..
+                                } => {
+                                    notificaciones += 1;
+                                    let resp = if notificaciones == 1 {
+                                        MensajeEntreEstacionesTCP::NoRegistradoAun { event_id }
+                                    } else {
+                                        MensajeEntreEstacionesTCP::DatosParaCobro {
+                                            event_id,
+                                            rental_id: RentalId("R-lider".to_string()),
+                                            preauth_id: "P-mock".to_string(),
+                                            t0: Timestamp(0),
+                                            estacion_origen: EstacionId(2),
+                                        }
+                                    };
+                                    let _ = stream.write_all(&enmarcar(&resp).unwrap());
+                                }
+                                otro => {
+                                    let _ = tx.send(otro);
+                                }
+                            }
+                        } else if comun::serializacion::desde_bytes::<MensajeUsuario>(&payload)
+                            .is_ok()
+                        {
+                            let resp = MensajeEstacionAUsuarioConsulta::RespuestaLider {
+                                lider_id: EstacionId(9),
+                                lider_addr: addr,
+                                term: 0,
+                            };
+                            let _ = stream.write_all(&enmarcar(&resp).unwrap());
+                        }
+                    }
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn la_devolucion_reintenta_cuando_el_lider_responde_no_registrado_aun() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let (lider_addr, eventos) = lider_mock();
+            let estaciones: HashMap<EstacionId, SocketAddr> =
+                [(EstacionId(9), lider_addr)].into_iter().collect();
+            let s0 = Slot::nuevo(0).start(); // vacío: puede aceptar la bici
+            let estacion = Estacion::new(
+                EstacionId(2),
+                (0.0, 0.0),
+                vec![s0],
+                pasarela,
+                (EstacionId(9), lider_addr),
+                false,
+                estaciones,
+            )
+            .start();
+            let comunicador = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                estacion.clone().recipient(),
+            )
+            .start();
+            estacion
+                .send(RegistrarComunicador(comunicador))
+                .await
+                .unwrap();
+
+            // El usuario devuelve la bici: aceptada al toque, cierre en background.
+            let resp = estacion
+                .send(SolicitudUsuario(
+                    MensajeUsuarioAEstacion::SolicitudDevolucion {
+                        usuario_id: UsuarioId("alice".to_string()),
+                        bici_id: BiciId(42),
+                        rental_id: RentalId("R-lider".to_string()),
+                        slot_id: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::DevolucionAceptada { .. }
+            ));
+
+            // El primer Notificar recibe NoRegistradoAun; el reintento obtiene
+            // los datos, cobra y cierra con DevolucionProcesada hacia el líder.
+            let mut recibido = None;
+            for _ in 0..100 {
+                if let Ok(msg) = eventos.try_recv() {
+                    recibido = Some(msg);
+                    break;
+                }
+                actix::clock::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            match recibido {
+                Some(MensajeEntreEstacionesTCP::DevolucionProcesada { rental_id, .. }) => {
+                    assert_eq!(rental_id, RentalId("R-lider".to_string()));
+                }
+                otro => panic!("esperaba DevolucionProcesada tras el reintento, fue {otro:?}"),
             }
         });
     }
