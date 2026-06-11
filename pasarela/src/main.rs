@@ -30,9 +30,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let addr_red = SocketAddr::from(([127, 0, 0, 1], puerto));
 
+    // Persistencia opcional: con `--estado <ruta>` el estado sobrevive reinicios.
+    let estado_arg = comun::args::flag("--estado");
+
     let system = System::new();
     let _actores = system.block_on(async move {
-        let procesador = ProcesadorPagos::new(config.tarifa.clone()).start();
+        let mut procesador = ProcesadorPagos::new(config.tarifa.clone());
+        if let Some(ruta) = estado_arg {
+            procesador = procesador.con_persistencia(PathBuf::from(ruta));
+        }
+        let procesador = procesador.start();
         let comunicador =
             Comunicador::new(addr_red, addr_red, procesador.clone().recipient()).start();
         println!("[pasarela] escuchando en {addr_red} (TCP); a la espera (ctrl-c para salir)");

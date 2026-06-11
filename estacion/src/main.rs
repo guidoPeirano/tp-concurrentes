@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect();
         // La Estacion toma posesión de los slots (mantiene vivas sus Addr).
-        let estacion = Estacion::new(
+        let mut estacion = Estacion::new(
             id,
             mi_config.ubicacion,
             slots,
@@ -82,8 +82,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             (config.lider, lider_addr),
             es_lider,
             estaciones,
-        )
-        .start();
+        );
+        // Persistencia opcional: con `--estado <ruta>` el estado sobrevive reinicios.
+        if let Some(ruta) = comun::args::flag("--estado") {
+            estacion = estacion.con_persistencia(PathBuf::from(ruta));
+        }
+        let estacion = estacion.start();
         let comunicador =
             Comunicador::new(addr_red, addr_red, estacion.clone().recipient()).start();
         // Le damos a la estación la Addr de su Comunicador (para hablar con la pasarela).

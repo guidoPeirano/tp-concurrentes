@@ -6,6 +6,7 @@
 //! reprocesan. La persistencia en disco llega en la Etapa 6.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use actix::prelude::*;
@@ -15,6 +16,7 @@ use comun::mensajes::estacion_pasarela::{
     MensajeEstacionAPasarela, MensajePasarelaAEstacion, VotoResultado,
 };
 use comun::{DatosTarjeta, TransaccionId};
+use serde::{Deserialize, Serialize};
 
 use crate::mensajes::PedidoPasarela;
 use crate::tarifa::calcular_monto;
@@ -30,20 +32,31 @@ pub struct ProcesadorPagos {
     tarifa: TarifaConfig,
     contador: u64,
     timeout_transaccion: Duration,
+    /// Archivo de persistencia (si está, el estado sobrevive un reinicio).
+    archivo: Option<PathBuf>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct PreAutorizacion {
     tx_id: Option<TransaccionId>,
     monto_reservado: f64,
     estado: EstadoPreAuth,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum EstadoPreAuth {
     Preparada,
     Activa,
     Cobrada { monto_final: f64 },
     Anulada,
+}
+
+/// Lo que la pasarela guarda en disco: las preauths y el contador (para no
+/// repetir ids después de un reinicio).
+#[derive(Serialize, Deserialize)]
+struct EstadoEnDisco {
+    pre_autorizaciones: HashMap<String, PreAutorizacion>,
+    contador: u64,
 }
 
 impl ProcesadorPagos {
@@ -53,6 +66,35 @@ impl ProcesadorPagos {
             tarifa,
             contador: 0,
             timeout_transaccion: TIMEOUT_TRANSACCION,
+            archivo: None,
+        }
+    }
+
+    /// Activa la persistencia en `ruta`: si ya hay un estado guardado lo carga
+    /// (recuperación tras reinicio), y de acá en más cada cambio se guarda.
+    pub fn con_persistencia(mut self, ruta: PathBuf) -> Self {
+        if let Some(estado) = comun::persistencia::cargar::<EstadoEnDisco>(&ruta) {
+            println!(
+                "[pasarela] estado recuperado de {:?}: {} pre-autorizaciones",
+                ruta,
+                estado.pre_autorizaciones.len()
+            );
+            self.pre_autorizaciones = estado.pre_autorizaciones;
+            self.contador = estado.contador;
+        }
+        self.archivo = Some(ruta);
+        self
+    }
+
+    /// Vuelca el estado a disco (si la persistencia está activa).
+    fn persistir(&self) {
+        let Some(ruta) = &self.archivo else { return };
+        let estado = EstadoEnDisco {
+            pre_autorizaciones: self.pre_autorizaciones.clone(),
+            contador: self.contador,
+        };
+        if let Err(e) = comun::persistencia::guardar(ruta, &estado) {
+            eprintln!("[pasarela] no pude persistir el estado en {ruta:?}: {e}");
         }
     }
 
@@ -85,6 +127,7 @@ impl ProcesadorPagos {
                     println!(
                         "[pasarela] timeout de la preauth {preauth_id}: anulada, fondos liberados"
                     );
+                    pagos.persistir();
                 }
             }
         });
@@ -227,6 +270,7 @@ impl Handler<PedidoPasarela> for ProcesadorPagos {
     fn handle(&mut self, msg: PedidoPasarela, ctx: &mut Self::Context) -> Self::Result {
         let respuesta = self.procesar(msg.0);
         self.programar_timeout(&respuesta, ctx);
+        self.persistir();
         MessageResult(respuesta)
     }
 }
@@ -240,6 +284,9 @@ impl Handler<PaqueteRecibido> for ProcesadorPagos {
         if let (Some(pedido), Some(responder)) = (pedido, msg.responder) {
             let respuesta = self.procesar(pedido);
             self.programar_timeout(&respuesta, ctx);
+            // Persistir ANTES de responder: si nos caemos justo acá, el estado
+            // guardado ya refleja lo que la estación va a dar por confirmado.
+            self.persistir();
             if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
                 responder.responder(bytes);
             }
@@ -366,6 +413,53 @@ mod tests {
             } => id,
             otro => panic!("esperaba Voto con preauth_id, fue {otro:?}"),
         }
+    }
+
+    #[test]
+    fn el_estado_sobrevive_un_reinicio() {
+        System::new().block_on(async {
+            let ruta = std::env::temp_dir().join("tp-bicis-test-pasarela-reinicio.json");
+            let _ = std::fs::remove_file(&ruta);
+
+            // "Primera corrida": prepare + commit, persistidos.
+            let p1 = ProcesadorPagos::new(tarifa())
+                .con_persistencia(ruta.clone())
+                .start();
+            let id = preauth_id(enviar(&p1, prepare("T1", "123")).await);
+            enviar(
+                &p1,
+                Pedido::CommitPreauth {
+                    tx_id: TransaccionId("T1".to_string()),
+                    preauth_id: id.clone(),
+                },
+            )
+            .await;
+
+            // "Reinicio": una instancia nueva carga el estado desde el archivo
+            // y puede cobrar la preauth que quedó activa.
+            let p2 = ProcesadorPagos::new(tarifa())
+                .con_persistencia(ruta.clone())
+                .start();
+            let cobro = enviar(
+                &p2,
+                Pedido::ProcesarCobro {
+                    preauth_id: id,
+                    t0: Timestamp(0),
+                    t1: Timestamp(120_000),
+                },
+            )
+            .await;
+            assert!(
+                matches!(cobro, MensajePasarelaAEstacion::CobroConfirmado { monto, .. } if monto == 70.0),
+                "esperaba CobroConfirmado de 70 tras el reinicio, fue {cobro:?}"
+            );
+
+            // El contador también se recupera: una preauth nueva no repite id.
+            let id2 = preauth_id(enviar(&p2, prepare("T2", "123")).await);
+            assert_ne!(id2, "P-1", "el contador no debe arrancar de cero");
+
+            let _ = std::fs::remove_file(&ruta);
+        });
     }
 
     #[test]

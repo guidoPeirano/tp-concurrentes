@@ -8,6 +8,7 @@ pub mod dominio;
 pub mod framing;
 pub mod ids;
 pub mod mensajes;
+pub mod persistencia;
 pub mod serializacion;
 pub mod tiempo;
 
