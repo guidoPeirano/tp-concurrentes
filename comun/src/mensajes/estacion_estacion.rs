@@ -50,7 +50,9 @@ pub enum MensajeEntreEstacionesTCP {
         t1: Timestamp,
         monto_cobrado: f64,
     },
-    /// CU1/CU2 — ACK idempotente de un evento ya procesado por el líder.
+    /// CU4 — ACK de los mensajes del Ring: el que reenvía solo da por
+    /// entregado un `Election`/`Coordinator` si el receptor contesta esto
+    /// (un nodo colgado acepta la conexión pero no responde).
     EventoProcesadoAck {
         event_id: EventId,
     },
@@ -78,15 +80,6 @@ pub enum MensajeEntreEstacionesTCP {
     },
     NoLoTengo {
         event_id: EventId,
-        bici_id: BiciId,
-    },
-    AlquilerNoEncontrado {
-        bici_id: BiciId,
-    },
-    ReprocesarDevolucion {
-        bici_id: BiciId,
-    },
-    BiciHuerfanaConfirmada {
         bici_id: BiciId,
     },
 

@@ -79,8 +79,7 @@ impl Usuario {
                     rental_id: rental_id.clone(),
                 };
             }
-            MensajeEstacionAUsuario::DevolucionAceptada { .. }
-            | MensajeEstacionAUsuario::DevolucionCompletada { .. } => {
+            MensajeEstacionAUsuario::DevolucionAceptada { .. } => {
                 self.estado = EstadoUsuario::SinBici;
             }
             // Rechazos: el estado no cambia.
