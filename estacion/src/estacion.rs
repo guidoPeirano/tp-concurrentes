@@ -41,6 +41,10 @@ const UMBRAL_FALLOS_LIDER: u8 = 2;
 /// (cubre el caso de un mensaje del Ring perdido por una caída en cadena).
 const UMBRAL_ELECCION_TRABADA: u8 = 5;
 
+/// Cuánto espera el coordinador del 2PC el voto de la pasarela antes de tomarlo
+/// como No implícito (Caso A de la sección 7.1.1 del README).
+const TIMEOUT_PREPARE: std::time::Duration = std::time::Duration::from_secs(3);
+
 use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarCache, ConsultarEstado,
@@ -507,11 +511,9 @@ impl Estacion {
 
     /// Vigilancia del líder (corre cada `INTERVALO_VIGILANCIA`): un follower
     /// sondea al líder con un request-response; tras `UMBRAL_FALLOS_LIDER` fallos
-    /// consecutivos lo da por caído e inicia una elección.
-    ///
-    /// TODO(etapa 6): el sondeo detecta un proceso caído (conexión rechazada),
-    /// pero no uno colgado con el socket abierto; eso lo cubren los timeouts de
-    /// lectura que llegan con la tolerancia a fallas.
+    /// consecutivos lo da por caído e inicia una elección. Cubre tanto al líder
+    /// caído (conexión rechazada, falla al instante) como al colgado (el sondeo
+    /// vence por el timeout de lectura del Comunicador).
     fn vigilar_lider(&mut self, ctx: &mut Context<Self>) {
         match self.eleccion.lider_conocido() {
             EstadoLider::Conocido(lider_id) if lider_id == self.id => return, // el líder soy yo
@@ -895,15 +897,22 @@ async fn procesar_operacion(
                 tarjeta,
                 monto_propuesto: MONTO_RESERVA,
             };
-            let (pasarela_ok, preauth_id) =
-                match consultar_pasarela(&comunicador, pasarela, &prepare).await {
-                    Some(MensajePasarelaAEstacion::Voto {
-                        resultado: VotoResultado::Yes,
-                        preauth_id: Some(id),
-                        ..
-                    }) => (true, Some(id)),
-                    _ => (false, None),
-                };
+            // Caso A: si la pasarela no vota dentro del plazo, es un No implícito
+            // (el alquiler se aborta y el slot conserva su bici).
+            let respuesta_pasarela = comun::tiempo::con_timeout(
+                TIMEOUT_PREPARE,
+                consultar_pasarela(&comunicador, pasarela, &prepare),
+            )
+            .await;
+            let hubo_timeout = respuesta_pasarela.is_none();
+            let (pasarela_ok, preauth_id) = match respuesta_pasarela.flatten() {
+                Some(MensajePasarelaAEstacion::Voto {
+                    resultado: VotoResultado::Yes,
+                    preauth_id: Some(id),
+                    ..
+                }) => (true, Some(id)),
+                _ => (false, None),
+            };
 
             // --- FASE DECISIÓN ---
             if voto_slot == Voto::Si && pasarela_ok {
@@ -919,7 +928,13 @@ async fn procesar_operacion(
                     tx_id,
                     preauth_id: preauth_id.clone(),
                 };
-                let _ = consultar_pasarela(&comunicador, pasarela, &commit).await;
+                // También con plazo: una pasarela colgada acá no debe dejar al
+                // usuario esperando (Caso C: ella completa el commit al volver).
+                let _ = comun::tiempo::con_timeout(
+                    TIMEOUT_PREPARE,
+                    consultar_pasarela(&comunicador, pasarela, &commit),
+                )
+                .await;
 
                 match bici {
                     Some(bici_id) => {
@@ -963,10 +978,16 @@ async fn procesar_operacion(
                         tx_id,
                         preauth_id: id,
                     };
-                    let _ = consultar_pasarela(&comunicador, pasarela, &abort).await;
+                    let _ = comun::tiempo::con_timeout(
+                        TIMEOUT_PREPARE,
+                        consultar_pasarela(&comunicador, pasarela, &abort),
+                    )
+                    .await;
                 }
                 let motivo = if voto_slot != Voto::Si {
                     "el slot no tenía una bici disponible".to_string()
+                } else if hubo_timeout {
+                    "timeout en preparación".to_string()
                 } else {
                     "la pasarela rechazó el pago o no respondió".to_string()
                 };
@@ -1385,6 +1406,46 @@ mod tests {
                 reply,
                 MensajeEntreEstacionesTCP::NoRegistradoAun { .. }
             ));
+        });
+    }
+
+    /// Pasarela "colgada": acepta la conexión, lee el pedido y nunca contesta.
+    /// Mantiene el stream vivo para que el timeout sea de verdad por espera (no
+    /// por conexión cerrada).
+    fn pasarela_muda() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut conexiones = Vec::new();
+            for conexion in listener.incoming() {
+                let Ok(mut stream) = conexion else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                conexiones.push(stream); // la dejamos abierta, sin responder
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn timeout_de_prepare_es_no_implicito_y_el_slot_conserva_la_bici() {
+        System::new().block_on(async {
+            // Caso A: la pasarela no vota dentro del plazo (TIMEOUT_PREPARE = 3s).
+            let pasarela = pasarela_muda();
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = arrancar(vec![s0.clone()], pasarela).await;
+
+            let resp = estacion.send(alquilar(0)).await.unwrap();
+            match resp {
+                MensajeEstacionAUsuario::AlquilerRechazado { motivo } => {
+                    assert_eq!(motivo, "timeout en preparación");
+                }
+                otro => panic!("esperaba AlquilerRechazado por timeout, fue {otro:?}"),
+            }
+            // El abort liberó la reserva del slot: la bici sigue ahí y se puede
+            // volver a intentar.
+            let estado = s0.send(ConsultarEstado).await.unwrap();
+            assert_eq!(estado.bici_id, Some(BiciId(42)), "la bici no se pierde");
         });
     }
 
