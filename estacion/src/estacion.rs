@@ -30,6 +30,7 @@ use comun::{
 /// Cada cuánto cada estación le manda su estado al líder por UDP.
 const INTERVALO_GOSSIP: std::time::Duration = std::time::Duration::from_secs(3);
 
+use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarCache, ConsultarEstado,
     ConsultarRegistro, PrepareLiberacion, ProcesarDevolucion, RegistrarComunicador,
@@ -74,6 +75,9 @@ pub struct Estacion {
     /// Direcciones de todas las estaciones, para alcanzar al origen en la devolución.
     estaciones: HashMap<EstacionId, SocketAddr>,
     rol: RolEstacion,
+    /// Estado del algoritmo de elección de líder (Ring): anillo, `term` y a quién
+    /// reconoce como líder.
+    eleccion: Eleccion,
     /// `Addr` del Comunicador propio (se cablea al arrancar con `RegistrarComunicador`).
     comunicador: Option<Addr<Comunicador>>,
     alquileres_propios: HashMap<RentalId, Alquiler>,
@@ -92,6 +96,7 @@ impl Estacion {
         estaciones: HashMap<EstacionId, SocketAddr>,
     ) -> Self {
         let (lider_id, lider) = lider;
+        let eleccion = Eleccion::new(id, estaciones.keys().copied()).con_lider_inicial(lider_id);
         Self {
             id,
             ubicacion,
@@ -108,6 +113,7 @@ impl Estacion {
             } else {
                 RolEstacion::Follower
             },
+            eleccion,
             comunicador: None,
             alquileres_propios: HashMap::new(),
             contador: 0,
@@ -290,8 +296,73 @@ impl Estacion {
                     alquiler.estado = EstadoAlquiler::Cerrado;
                 }
             }
-            // Ring (Etapa 5) y manejo de huérfanas (Etapa 6) más adelante.
+            // --- Ring de elección (CU4) ---
+            MensajeEntreEstacionesTCP::Election { ids, iniciador } => {
+                let accion = self.eleccion.recibir_election(ids, iniciador);
+                self.aplicar_liderazgo();
+                self.ejecutar_accion_ring(accion);
+            }
+            MensajeEntreEstacionesTCP::Coordinator { lider, term } => {
+                let accion = self.eleccion.recibir_coordinator(lider, term);
+                self.aplicar_liderazgo();
+                self.ejecutar_accion_ring(accion);
+            }
+            // Reconstrucción del registro y manejo de huérfanas: PRs siguientes.
             _ => {}
+        }
+    }
+
+    /// Manda un mensaje entre estaciones al `destino` (resuelve su dirección en la
+    /// tabla de estaciones y lo despacha por el Comunicador).
+    fn enviar_a_estacion(&self, destino: EstacionId, mensaje: &MensajeEntreEstacionesTCP) {
+        if let (Some(addr), Some(comunicador), Ok(bytes)) = (
+            self.estaciones.get(&destino).copied(),
+            &self.comunicador,
+            comun::serializacion::a_bytes(mensaje),
+        ) {
+            comunicador.do_send(EnviarTcp {
+                destino: addr,
+                datos: bytes,
+            });
+        }
+    }
+
+    /// Ejecuta la acción que dictó el algoritmo de elección: reenviar el mensaje al
+    /// siguiente del anillo y/o no hacer nada. El cambio de rol lo aplica antes
+    /// `aplicar_liderazgo`.
+    fn ejecutar_accion_ring(&mut self, accion: AccionRing) {
+        match accion {
+            AccionRing::Ignorar => {}
+            AccionRing::Reenviar { destino, mensaje } => self.enviar_a_estacion(destino, &mensaje),
+            AccionRing::AsumirYReenviar { destino, mensaje } => {
+                if let Some(destino) = destino {
+                    self.enviar_a_estacion(destino, &mensaje);
+                }
+            }
+        }
+    }
+
+    /// Sincroniza el rol y el puntero al líder con lo que dictaminó el Ring. Si el
+    /// líder cambió, ajusta `lider`/`lider_id`; si paso a ser líder arranco con el
+    /// registro vacío (la reconstrucción real es del próximo PR), y si dejo de
+    /// serlo vuelvo a follower.
+    fn aplicar_liderazgo(&mut self) {
+        let EstadoLider::Conocido(lider_id) = self.eleccion.lider_conocido() else {
+            return;
+        };
+        self.lider_id = lider_id;
+        if let Some(addr) = self.estaciones.get(&lider_id).copied() {
+            self.lider = addr;
+        }
+        let soy_lider = lider_id == self.id;
+        let era_lider = matches!(self.rol, RolEstacion::Lider { .. });
+        if soy_lider && !era_lider {
+            self.rol = RolEstacion::Lider {
+                registro: Registro::new(),
+                cache: HashMap::new(),
+            };
+        } else if !soy_lider && era_lider {
+            self.rol = RolEstacion::Follower;
         }
     }
 

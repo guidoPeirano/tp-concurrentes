@@ -2,6 +2,7 @@
 //! Comunicador, que abre los sockets TCP/UDP) y queda a la espera. La lógica de
 //! negocio se agrega etapa por etapa.
 
+mod eleccion;
 mod estacion;
 mod mensajes;
 mod registro;
