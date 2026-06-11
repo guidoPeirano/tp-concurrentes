@@ -3,6 +3,12 @@
 //! Es la unidad atómica del 2PC de alquiler: reserva tentativamente la bici en
 //! la fase Prepare y la libera en Commit (o suelta la reserva en Abort). También
 //! asegura bicis que llegan en una devolución.
+//!
+//! Tolerancia a fallas (Caso B): si después de votar Sí no llega ni Commit ni
+//! Abort dentro del plazo, el slot aborta unilateralmente — suelta la reserva y
+//! se queda con la bici. Así una caída del coordinador no deja al slot bloqueado.
+
+use std::time::Duration;
 
 use actix::prelude::*;
 use comun::{BiciId, TransaccionId};
@@ -12,10 +18,15 @@ use crate::mensajes::{
     Voto,
 };
 
+/// Cuánto espera el slot la decisión (Commit/Abort) después de votar Sí, antes
+/// de abortar por su cuenta (Caso B de la sección 7.1.1 del README).
+const TIMEOUT_TRANSACCION: Duration = Duration::from_secs(10);
+
 pub struct Slot {
     id: u32,
     bici: Option<BiciId>,
     reservado_para: Option<TransaccionId>,
+    timeout_transaccion: Duration,
 }
 
 impl Slot {
@@ -25,16 +36,24 @@ impl Slot {
             id,
             bici: None,
             reservado_para: None,
+            timeout_transaccion: TIMEOUT_TRANSACCION,
         }
     }
 
     /// Crea un slot que ya tiene una bici asegurada.
     pub fn con_bici(id: u32, bici: BiciId) -> Self {
         Self {
-            id,
             bici: Some(bici),
-            reservado_para: None,
+            ..Self::nuevo(id)
         }
+    }
+
+    /// Cambia el plazo del Caso B (lo usan los tests para no esperar 10s).
+    /// Cuando los timeouts se levanten de la config, esto deja de ser solo de test.
+    #[cfg(test)]
+    pub fn con_timeout_de_transaccion(mut self, plazo: Duration) -> Self {
+        self.timeout_transaccion = plazo;
+        self
     }
 }
 
@@ -49,10 +68,23 @@ impl Actor for Slot {
 impl Handler<PrepareLiberacion> for Slot {
     type Result = MessageResult<PrepareLiberacion>;
 
-    fn handle(&mut self, msg: PrepareLiberacion, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: PrepareLiberacion, ctx: &mut Self::Context) -> Self::Result {
         // Vota Sí solo si tiene una bici y no está ya reservado para otra tx.
         let voto = if self.bici.is_some() && self.reservado_para.is_none() {
-            self.reservado_para = Some(msg.tx_id);
+            self.reservado_para = Some(msg.tx_id.clone());
+            // Caso B: si al vencer el plazo la decisión no llegó y la reserva
+            // sigue siendo de ESTA tx, abortamos por nuestra cuenta. Si en el
+            // medio hubo Commit (reserva en None) o llegó otra tx, no hace nada.
+            let tx_id = msg.tx_id;
+            ctx.run_later(self.timeout_transaccion, move |slot, _ctx| {
+                if slot.reservado_para.as_ref() == Some(&tx_id) {
+                    slot.reservado_para = None;
+                    println!(
+                        "  slot {}: timeout de la transacción {:?}, aborto unilateral (la bici queda)",
+                        slot.id, tx_id
+                    );
+                }
+            });
             Voto::Si
         } else {
             Voto::No
@@ -198,6 +230,56 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(voto, Voto::Si);
+        });
+    }
+
+    #[test]
+    fn tras_el_timeout_la_reserva_se_libera_sola_y_la_bici_queda() {
+        System::new().block_on(async {
+            // Plazo corto para no esperar los 10s reales.
+            let slot = Slot::con_bici(0, BiciId(5))
+                .con_timeout_de_transaccion(Duration::from_millis(100))
+                .start();
+            let voto = slot
+                .send(PrepareLiberacion { tx_id: tx("T1") })
+                .await
+                .unwrap();
+            assert_eq!(voto, Voto::Si);
+
+            // El coordinador "se cayó": no llega ni Commit ni Abort.
+            actix::clock::sleep(Duration::from_millis(200)).await;
+
+            // La bici sigue en el slot y la reserva se liberó: otra tx puede votar Sí.
+            let estado = slot.send(ConsultarEstado).await.unwrap();
+            assert_eq!(estado.bici_id, Some(BiciId(5)), "la bici no se pierde");
+            let voto2 = slot
+                .send(PrepareLiberacion { tx_id: tx("T2") })
+                .await
+                .unwrap();
+            assert_eq!(voto2, Voto::Si, "la reserva vieja ya no bloquea");
+        });
+    }
+
+    #[test]
+    fn el_commit_a_tiempo_no_se_ve_afectado_por_el_timeout() {
+        System::new().block_on(async {
+            let slot = Slot::con_bici(0, BiciId(5))
+                .con_timeout_de_transaccion(Duration::from_millis(100))
+                .start();
+            slot.send(PrepareLiberacion { tx_id: tx("T1") })
+                .await
+                .unwrap();
+            // El Commit llega antes del plazo: la bici se libera normalmente.
+            let bici = slot
+                .send(CommitLiberacion { tx_id: tx("T1") })
+                .await
+                .unwrap();
+            assert_eq!(bici, Some(BiciId(5)));
+
+            // El timer vence después y no debe romper nada (la tx ya no existe).
+            actix::clock::sleep(Duration::from_millis(200)).await;
+            let estado = slot.send(ConsultarEstado).await.unwrap();
+            assert_eq!(estado.bici_id, None, "el slot quedó vacío por el commit");
         });
     }
 
