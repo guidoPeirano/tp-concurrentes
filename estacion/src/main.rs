@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use actix::prelude::*;
-use comun::comunicador::Comunicador;
+use comun::comunicador::{Comunicador, SimularConectividad};
 use comun::{BiciId, Config, EstacionId};
 
 use crate::estacion::Estacion;
@@ -97,6 +97,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             id_arg, addr_red, SLOTS_POR_ESTACION
         );
         (comunicador, estacion)
+    });
+
+    // Consola del proceso: simular pérdida/recuperación de conectividad.
+    // (Si el proceso corre sin stdin —tests e2e—, el thread termina solo.)
+    let comunicador_consola = _actores.0.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for linea in stdin.lock().lines().map_while(Result::ok) {
+            match linea.trim() {
+                "desconectar" => {
+                    comunicador_consola.do_send(SimularConectividad { conectado: false })
+                }
+                "conectar" => comunicador_consola.do_send(SimularConectividad { conectado: true }),
+                "" => {}
+                otro => println!("[consola] comando desconocido: {otro} (desconectar | conectar)"),
+            }
+        }
     });
 
     system.run()?;

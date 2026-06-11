@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -111,6 +113,15 @@ pub struct MarcarAlcanzable {
     pub alcanzable: bool,
 }
 
+/// Simula un corte de red (lo dispara la consola del proceso): mientras está
+/// desconectado, todo lo que entra y sale por este Comunicador se descarta.
+/// Al reconectar, el re-sondeo va desmarcando lo que volvió.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SimularConectividad {
+    pub conectado: bool,
+}
+
 /// Cada cuánto el Comunicador re-sondea (conexión corta) las direcciones que
 /// tiene marcadas como inalcanzables, para detectar que volvieron.
 const INTERVALO_RESONDEO: Duration = Duration::from_secs(3);
@@ -125,6 +136,8 @@ pub struct Comunicador {
     /// Servicios alcanzables, por dirección: el resultado de la última
     /// operación TCP saliente hacia cada destino.
     alcanzables: HashMap<SocketAddr, bool>,
+    /// Corte de red simulado (compartido con los threads de escucha).
+    desconectado: Arc<AtomicBool>,
 }
 
 impl Comunicador {
@@ -139,13 +152,22 @@ impl Comunicador {
             destino,
             socket_udp: None,
             alcanzables: HashMap::new(),
+            desconectado: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn esta_desconectado(&self) -> bool {
+        self.desconectado.load(Ordering::Relaxed)
     }
 
     /// Re-sondea (conexión corta, en un thread) las direcciones marcadas como
     /// inalcanzables; si alguna volvió, se desmarca. Así el Caso E termina solo
     /// cuando la pasarela reaparece.
     fn resondear(&self, ctx: &mut Context<Self>) {
+        // Con el corte simulado activo no hay nada que re-sondear.
+        if self.esta_desconectado() {
+            return;
+        }
         let caidas: Vec<SocketAddr> = self
             .alcanzables
             .iter()
@@ -173,8 +195,16 @@ impl Actor for Comunicador {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        escuchar_tcp(self.addr_tcp, self.destino.clone());
-        self.socket_udp = Some(escuchar_udp(self.addr_udp, self.destino.clone()));
+        escuchar_tcp(
+            self.addr_tcp,
+            self.destino.clone(),
+            Arc::clone(&self.desconectado),
+        );
+        self.socket_udp = Some(escuchar_udp(
+            self.addr_udp,
+            self.destino.clone(),
+            Arc::clone(&self.desconectado),
+        ));
         ctx.run_interval(INTERVALO_RESONDEO, |act, ctx| act.resondear(ctx));
     }
 }
@@ -183,6 +213,9 @@ impl Handler<EnviarTcp> for Comunicador {
     type Result = ();
 
     fn handle(&mut self, msg: EnviarTcp, _ctx: &mut Self::Context) {
+        if self.esta_desconectado() {
+            return; // corte simulado: el envío se pierde
+        }
         // El envío es bloqueante; lo hacemos en un thread para no frenar al actor.
         thread::spawn(move || enviar_tcp(msg.destino, &msg.datos));
     }
@@ -192,6 +225,9 @@ impl Handler<EnviarUdp> for Comunicador {
     type Result = ();
 
     fn handle(&mut self, msg: EnviarUdp, _ctx: &mut Self::Context) {
+        if self.esta_desconectado() {
+            return; // corte simulado: el datagrama se pierde
+        }
         if let Some(socket) = &self.socket_udp {
             let _ = socket.send_to(&msg.datos, msg.destino);
         }
@@ -207,6 +243,11 @@ impl Handler<ConsultarTcp> for Comunicador {
         // bloqueara el arbiter, dos procesos que se consultan mutuamente (p.ej.
         // el líder reconstruyendo el registro mientras un follower lo sondea)
         // quedarían esperándose para siempre.
+        if self.esta_desconectado() {
+            // Corte simulado: la consulta falla y el destino queda marcado.
+            self.alcanzables.insert(msg.destino, false);
+            return Box::pin(async { None });
+        }
         let yo = ctx.address();
         Box::pin(async move {
             let destino = msg.destino;
@@ -228,6 +269,10 @@ impl Handler<EnviarTcpConfirmado> for Comunicador {
     fn handle(&mut self, msg: EnviarTcpConfirmado, ctx: &mut Self::Context) -> Self::Result {
         // Mismo esquema que `ConsultarTcp`: el envío (con sus reintentos de
         // conexión) corre en un thread para no frenar al actor.
+        if self.esta_desconectado() {
+            self.alcanzables.insert(msg.destino, false);
+            return Box::pin(async { false });
+        }
         let yo = ctx.address();
         Box::pin(async move {
             let destino = msg.destino;
@@ -240,6 +285,21 @@ impl Handler<EnviarTcpConfirmado> for Comunicador {
             });
             entregado
         })
+    }
+}
+
+impl Handler<SimularConectividad> for Comunicador {
+    type Result = ();
+
+    fn handle(&mut self, msg: SimularConectividad, _ctx: &mut Self::Context) {
+        self.desconectado.store(!msg.conectado, Ordering::Relaxed);
+        if msg.conectado {
+            println!("[comunicador] red RESTABLECIDA (simulación)");
+        } else {
+            println!(
+                "[comunicador] red CORTADA (simulación): se descarta todo lo que entra y sale"
+            );
+        }
     }
 }
 
@@ -298,7 +358,7 @@ where
 
 /// Levanta el listener TCP en un thread; por cada conexión, otro thread lee y
 /// desenmarca, reenviando cada payload al destino.
-fn escuchar_tcp(addr: SocketAddr, destino: Recipient<PaqueteRecibido>) {
+fn escuchar_tcp(addr: SocketAddr, destino: Recipient<PaqueteRecibido>, corte: Arc<AtomicBool>) {
     let listener =
         TcpListener::bind(addr).unwrap_or_else(|e| panic!("no pude bindear TCP en {addr}: {e}"));
     thread::spawn(move || {
@@ -306,7 +366,8 @@ fn escuchar_tcp(addr: SocketAddr, destino: Recipient<PaqueteRecibido>) {
             match conexion {
                 Ok(stream) => {
                     let destino = destino.clone();
-                    thread::spawn(move || leer_stream_tcp(stream, destino));
+                    let corte = Arc::clone(&corte);
+                    thread::spawn(move || leer_stream_tcp(stream, destino, corte));
                 }
                 Err(_) => continue,
             }
@@ -314,7 +375,11 @@ fn escuchar_tcp(addr: SocketAddr, destino: Recipient<PaqueteRecibido>) {
     });
 }
 
-fn leer_stream_tcp(mut stream: TcpStream, destino: Recipient<PaqueteRecibido>) {
+fn leer_stream_tcp(
+    mut stream: TcpStream,
+    destino: Recipient<PaqueteRecibido>,
+    corte: Arc<AtomicBool>,
+) {
     let mut desenmarcador = Desenmarcador::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -323,6 +388,11 @@ fn leer_stream_tcp(mut stream: TcpStream, destino: Recipient<PaqueteRecibido>) {
             Ok(n) => {
                 desenmarcador.alimentar(&buf[..n]);
                 while let Some(payload) = desenmarcador.siguiente_payload() {
+                    // Corte simulado: lo que llega se descarta sin responder
+                    // (para el que mandó, es igual que un proceso colgado).
+                    if corte.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     // Por cada pedido, le damos al actor un canal para responder.
                     let (tx, rx) = mpsc::channel();
                     destino.do_send(PaqueteRecibido {
@@ -347,13 +417,20 @@ fn leer_stream_tcp(mut stream: TcpStream, destino: Recipient<PaqueteRecibido>) {
 
 /// Bindea el socket UDP, deja un thread escuchando datagramas y devuelve un clon
 /// del socket para poder enviar.
-fn escuchar_udp(addr: SocketAddr, destino: Recipient<PaqueteRecibido>) -> UdpSocket {
+fn escuchar_udp(
+    addr: SocketAddr,
+    destino: Recipient<PaqueteRecibido>,
+    corte: Arc<AtomicBool>,
+) -> UdpSocket {
     let socket =
         UdpSocket::bind(addr).unwrap_or_else(|e| panic!("no pude bindear UDP en {addr}: {e}"));
     let socket_recv = socket.try_clone().expect("clonar socket UDP");
     thread::spawn(move || {
         let mut buf = [0u8; 65_535];
         while let Ok((n, _)) = socket_recv.recv_from(&mut buf) {
+            if corte.load(Ordering::Relaxed) {
+                continue; // corte simulado: el datagrama se descarta
+            }
             destino.do_send(PaqueteRecibido {
                 transporte: Transporte::Udp,
                 datos: buf[..n].to_vec(),
@@ -506,6 +583,73 @@ mod tests {
                 }
             }
             assert!(alcanzable, "el re-sondeo debería detectar que volvió");
+        });
+    }
+
+    #[test]
+    fn el_corte_simulado_descarta_lo_que_entra_y_lo_que_sale() {
+        System::new().block_on(async {
+            let (tx_a, rx_a) = mpsc::channel::<(Transporte, Vec<u8>)>();
+            let (tx_b, _rx_b) = mpsc::channel::<(Transporte, Vec<u8>)>();
+            let addr_a: SocketAddr = "127.0.0.1:18902".parse().unwrap();
+            let addr_b: SocketAddr = "127.0.0.1:18903".parse().unwrap();
+            let a =
+                Comunicador::new(addr_a, addr_a, Sonda { tx: tx_a }.start().recipient()).start();
+            let b =
+                Comunicador::new(addr_b, addr_b, Sonda { tx: tx_b }.start().recipient()).start();
+            actix::clock::sleep(Duration::from_millis(300)).await;
+
+            // A se queda sin red: lo que intenta mandar falla al instante...
+            a.send(SimularConectividad { conectado: false })
+                .await
+                .unwrap();
+            let entregado = a
+                .send(EnviarTcpConfirmado {
+                    destino: addr_b,
+                    datos: b"no-deberia-salir".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert!(!entregado, "sin red no se entrega nada");
+
+            // ...y lo que le mandan, se descarta (B sí tiene red).
+            let entregado = b
+                .send(EnviarTcpConfirmado {
+                    destino: addr_a,
+                    datos: b"a-un-cortado".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert!(entregado, "el kernel de A acepta los bytes igual");
+            actix::clock::sleep(Duration::from_millis(300)).await;
+            assert!(
+                rx_a.try_recv().is_err(),
+                "el payload no debe llegar al actor de A durante el corte"
+            );
+
+            // Vuelve la red: el tráfico fluye de nuevo.
+            a.send(SimularConectividad { conectado: true })
+                .await
+                .unwrap();
+            let entregado = b
+                .send(EnviarTcpConfirmado {
+                    destino: addr_a,
+                    datos: b"ahora-si".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert!(entregado);
+            let mut recibido = None;
+            for _ in 0..20 {
+                if let Ok(p) = rx_a.try_recv() {
+                    recibido = Some(p);
+                    break;
+                }
+                actix::clock::sleep(Duration::from_millis(100)).await;
+            }
+            let (transporte, datos) = recibido.expect("con la red de vuelta, el payload llega");
+            assert_eq!(transporte, Transporte::Tcp);
+            assert_eq!(datos, b"ahora-si");
         });
     }
 
