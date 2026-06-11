@@ -139,7 +139,7 @@ fn flujo_completo_por_la_repl() {
     assert!(salida.contains("DevolucionAceptada"), "salida:\n{salida}");
     // Tras devolver, vuelve a SinBici.
     assert!(
-        salida.trim_end().ends_with("SinBici"),
+        salida.trim_end().ends_with("SinBici (modo Conectado)"),
         "el estado final debería ser SinBici. salida:\n{salida}"
     );
 }
@@ -228,7 +228,7 @@ fn alquilar_en_una_estacion_y_devolver_en_otra() {
     assert!(salida.contains("ConBici"), "salida:\n{salida}");
     assert!(salida.contains("DevolucionAceptada"), "salida:\n{salida}");
     assert!(
-        salida.trim_end().ends_with("SinBici"),
+        salida.trim_end().ends_with("SinBici (modo Conectado)"),
         "el estado final debería ser SinBici. salida:\n{salida}"
     );
 }

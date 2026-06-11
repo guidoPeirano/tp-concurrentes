@@ -10,6 +10,16 @@ pub struct Usuario {
     id: UsuarioId,
     tarjeta: DatosTarjeta,
     estado: EstadoUsuario,
+    modo: ModoConectividad,
+}
+
+/// Conectividad del usuario (es móvil: puede quedarse sin señal). En
+/// `SoloLocal` puede alquilar y devolver contra una estación cercana, pero no
+/// consultar disponibilidad global (eso requiere llegar al líder).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModoConectividad {
+    Conectado,
+    SoloLocal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +43,17 @@ impl Usuario {
                 cvv: "123".to_string(),
             },
             estado: EstadoUsuario::SinBici,
+            modo: ModoConectividad::Conectado,
         }
+    }
+
+    pub fn modo(&self) -> ModoConectividad {
+        self.modo
+    }
+
+    /// Simula perder/recuperar la señal (lo dispara la REPL).
+    pub fn cambiar_modo(&mut self, modo: ModoConectividad) {
+        self.modo = modo;
     }
 
     pub fn id(&self) -> &UsuarioId {
@@ -80,6 +100,20 @@ mod tests {
             bici_id: BiciId(7),
             preauth_id: Some("local".to_string()),
         }
+    }
+
+    #[test]
+    fn el_modo_solo_local_se_activa_y_desactiva() {
+        let mut u = Usuario::new(UsuarioId("alice".to_string()));
+        assert_eq!(u.modo(), ModoConectividad::Conectado);
+        u.cambiar_modo(ModoConectividad::SoloLocal);
+        assert_eq!(u.modo(), ModoConectividad::SoloLocal);
+        // En SoloLocal puede seguir alquilando: el estado de alquiler es
+        // independiente de la conectividad.
+        u.aplicar(&confirmado());
+        assert!(matches!(u.estado(), EstadoUsuario::ConBici { .. }));
+        u.cambiar_modo(ModoConectividad::Conectado);
+        assert_eq!(u.modo(), ModoConectividad::Conectado);
     }
 
     #[test]

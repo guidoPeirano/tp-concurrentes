@@ -26,8 +26,8 @@ use comun::mensajes::usuario_estacion::{
     MensajeUsuarioAEstacion, MensajeUsuarioAEstacionConsulta,
 };
 use comun::{
-    Alquiler, BiciId, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId, Timestamp,
-    TransaccionId,
+    Alquiler, BiciId, DatosTarjeta, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId,
+    Timestamp, TransaccionId, UsuarioId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,12 +60,17 @@ const ESPERA_REINTENTO: std::time::Duration = std::time::Duration::from_millis(5
 /// confirmó (Caso C: el Commit se perdió o la pasarela estaba caída).
 const INTERVALO_REINTENTO_COMMITS: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Cada cuánto se intenta regularizar los pagos pendientes (alquileres que
+/// salieron offline, Caso E) contra la pasarela.
+const INTERVALO_REGULARIZACION: std::time::Duration = std::time::Duration::from_secs(5);
+
 use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitConfirmado, CommitLiberacion, ConsultarCache,
-    ConsultarCommitsPendientes, ConsultarEstado, ConsultarHuerfanas, ConsultarLider,
-    ConsultarPendientes, ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion,
-    RegistrarCommitPendiente, RegistrarComunicador, SolicitudUsuario, Voto,
+    ConsultarCobrosFallidos, ConsultarCommitsPendientes, ConsultarEstado, ConsultarHuerfanas,
+    ConsultarLider, ConsultarPagosPendientes, ConsultarPendientes, ConsultarRegistro, InfoLider,
+    PrepareLiberacion, ProcesarDevolucion, RegistrarCommitPendiente, RegistrarComunicador,
+    SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -146,16 +151,39 @@ pub struct Estacion {
     intervalo_reintento_commits: std::time::Duration,
     /// Bicis confirmadas huérfanas (auditoría, sección 8.2.1).
     huerfanas_confirmadas: usize,
+    /// Alquileres offline a la espera de su preauth diferida (Caso E).
+    pagos_pendientes: Vec<PagoPendiente>,
+    /// Cada cuánto intentar la regularización (acortable en tests).
+    intervalo_regularizacion: std::time::Duration,
+    /// Regularizaciones rechazadas por la pasarela (auditoría: CobroFallido).
+    cobros_fallidos: usize,
+}
+
+/// Alquiler completado localmente sin pasar por la pasarela (Caso E). Se
+/// persiste y se procesa cuando se restaura el acceso a la pasarela: primero la
+/// preauth diferida, recién después el reporte al líder. El cobro NO ocurre acá
+/// (sucede al devolverse la bici, por el flujo normal de CU2).
+#[derive(Clone, Serialize, Deserialize)]
+struct PagoPendiente {
+    rental_id: RentalId,
+    bici_id: BiciId,
+    usuario_id: UsuarioId,
+    tarjeta: DatosTarjeta,
+    t0: Timestamp,
 }
 
 /// Lo que la estación guarda en disco: sus alquileres, los commits decididos
-/// sin confirmar y la cola de eventos diferidos al líder. El rol y la elección
-/// NO se persisten: al reiniciar se rearma por config + discovery/elección.
+/// sin confirmar, la cola de eventos diferidos al líder y los pagos pendientes
+/// de regularización. El rol y la elección NO se persisten: al reiniciar se
+/// rearma por config + discovery/elección.
 #[derive(Serialize, Deserialize)]
 struct EstadoEnDisco {
     alquileres_propios: HashMap<RentalId, Alquiler>,
     commits_pendientes: Vec<(TransaccionId, String)>,
     eventos_pendientes: Vec<MensajeEntreEstacionesTCP>,
+    /// `default` para poder leer archivos guardados antes de que existiera.
+    #[serde(default)]
+    pagos_pendientes: Vec<PagoPendiente>,
 }
 
 impl Estacion {
@@ -194,7 +222,17 @@ impl Estacion {
             archivo: None,
             intervalo_reintento_commits: INTERVALO_REINTENTO_COMMITS,
             huerfanas_confirmadas: 0,
+            pagos_pendientes: Vec::new(),
+            intervalo_regularizacion: INTERVALO_REGULARIZACION,
+            cobros_fallidos: 0,
         }
+    }
+
+    /// Acorta el intervalo de regularización (para tests).
+    #[cfg(test)]
+    pub fn con_intervalo_de_regularizacion(mut self, intervalo: std::time::Duration) -> Self {
+        self.intervalo_regularizacion = intervalo;
+        self
     }
 
     /// Activa la persistencia en `ruta`: si ya hay un estado guardado lo carga
@@ -213,6 +251,7 @@ impl Estacion {
             self.alquileres_propios = estado.alquileres_propios;
             self.commits_pendientes = estado.commits_pendientes.into_iter().collect();
             self.eventos_pendientes = estado.eventos_pendientes;
+            self.pagos_pendientes = estado.pagos_pendientes;
             if let RolEstacion::Lider { registro, .. } = &mut self.rol {
                 for alquiler in self
                     .alquileres_propios
@@ -245,6 +284,7 @@ impl Estacion {
                 .map(|(t, p)| (t.clone(), p.clone()))
                 .collect(),
             eventos_pendientes: self.eventos_pendientes.clone(),
+            pagos_pendientes: self.pagos_pendientes.clone(),
         };
         if let Err(e) = comun::persistencia::guardar(ruta, &estado) {
             eprintln!("[{}] no pude persistir el estado en {ruta:?}: {e}", self.id);
@@ -974,6 +1014,96 @@ impl Estacion {
         });
         ctx.spawn(fut);
     }
+
+    /// Regularización del Caso E: cuando la pasarela vuelve a estar alcanzable,
+    /// cada `PagoPendiente` consigue su preauth diferida. El Commit va por la
+    /// maquinaria de commits pendientes (write-ahead + reintentos, Caso C), y
+    /// recién con la preauth puesta el alquiler se reporta al líder. Si la
+    /// pasarela rechaza la tarjeta, el alquiler queda como CobroFallido
+    /// (auditoría): no se va a cobrar.
+    fn regularizar_pagos(&mut self, ctx: &mut Context<Self>) {
+        if self.pagos_pendientes.is_empty() {
+            return;
+        }
+        let comunicador = self.comunicador.clone();
+        let pasarela = self.pasarela;
+        let pendientes = self.pagos_pendientes.clone();
+        let mi_id = self.id;
+        let base = self.proximo();
+        let fut = async move {
+            let mut resultados = Vec::new();
+            // Sin la pasarela de vuelta no hay nada que hacer todavía.
+            if !consultar_alcanzable(&comunicador, pasarela).await {
+                return resultados;
+            }
+            for (i, pago) in pendientes.into_iter().enumerate() {
+                let tx_id = TransaccionId(format!("T-{}-reg{}-{}", mi_id.0, base, i));
+                let prepare = MensajeEstacionAPasarela::PreparePreauth {
+                    tx_id: tx_id.clone(),
+                    usuario_id: pago.usuario_id.clone(),
+                    tarjeta: pago.tarjeta.clone(),
+                    monto_propuesto: MONTO_RESERVA,
+                };
+                match comun::tiempo::con_timeout(
+                    TIMEOUT_PREPARE,
+                    consultar_pasarela(&comunicador, pasarela, &prepare),
+                )
+                .await
+                .flatten()
+                {
+                    Some(MensajePasarelaAEstacion::Voto {
+                        resultado: VotoResultado::Yes,
+                        preauth_id: Some(preauth_id),
+                        ..
+                    }) => resultados.push((pago, tx_id, Ok(preauth_id))),
+                    Some(MensajePasarelaAEstacion::Voto {
+                        resultado: VotoResultado::No { motivo },
+                        ..
+                    }) => resultados.push((pago, tx_id, Err(motivo))),
+                    // Sin respuesta: el pago sigue pendiente, se reintenta.
+                    _ => {}
+                }
+            }
+            resultados
+        }
+        .into_actor(self)
+        .map(|resultados, actor, ctx| {
+            for (pago, tx_id, resultado) in resultados {
+                actor
+                    .pagos_pendientes
+                    .retain(|p| p.rental_id != pago.rental_id);
+                match resultado {
+                    Ok(preauth_id) => {
+                        println!(
+                            "[{}] pago regularizado para {}: preauth {} obtenida",
+                            actor.id, pago.bici_id, preauth_id
+                        );
+                        // El Commit va por la maquinaria del Caso C (write-ahead
+                        // + reintento); la pasarela cobra igual sobre Preparada.
+                        actor.commits_pendientes.insert(tx_id, preauth_id.clone());
+                        if let Some(alquiler) = actor.alquileres_propios.get_mut(&pago.rental_id) {
+                            alquiler.preauth_id = Some(preauth_id);
+                            let alquiler = alquiler.clone();
+                            // Recién ahora se reporta al líder (regla 7.1.1).
+                            // (Si el líder soy yo, reportar lo agrega directo
+                            // a mi registro; si no, viaja con la cola.)
+                            actor.reportar_alquiler(&alquiler, ctx);
+                        }
+                    }
+                    Err(motivo) => {
+                        actor.cobros_fallidos += 1;
+                        println!(
+                            "[{}] AUDITORÍA: regularización de {} rechazada ({motivo}): \
+                             CobroFallido, este alquiler no se cobrará",
+                            actor.id, pago.bici_id
+                        );
+                    }
+                }
+            }
+            actor.persistir();
+        });
+        ctx.spawn(fut);
+    }
 }
 
 /// Contexto inmutable de una operación (sin `&self`), para el trabajo async.
@@ -1021,6 +1151,10 @@ impl Actor for Estacion {
         // a los recuperados de disco tras un reinicio).
         ctx.run_interval(self.intervalo_reintento_commits, |act, ctx| {
             act.reintentar_commits(ctx)
+        });
+        // Caso E: los alquileres offline se regularizan al volver la pasarela.
+        ctx.run_interval(self.intervalo_regularizacion, |act, ctx| {
+            act.regularizar_pagos(ctx)
         });
     }
 }
@@ -1090,6 +1224,22 @@ impl Handler<ConsultarHuerfanas> for Estacion {
 
     fn handle(&mut self, _msg: ConsultarHuerfanas, _ctx: &mut Self::Context) -> usize {
         self.huerfanas_confirmadas
+    }
+}
+
+impl Handler<ConsultarPagosPendientes> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarPagosPendientes, _ctx: &mut Self::Context) -> usize {
+        self.pagos_pendientes.len()
+    }
+}
+
+impl Handler<ConsultarCobrosFallidos> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarCobrosFallidos, _ctx: &mut Self::Context) -> usize {
+        self.cobros_fallidos
     }
 }
 
@@ -1346,11 +1496,16 @@ async fn consultar_lider_devolucion(
 }
 
 /// Lógica del alquiler/devolución, sin estado de la estación. Devuelve la
-/// respuesta para el usuario y, si corresponde, el alquiler a registrar.
+/// respuesta para el usuario, el alquiler a registrar (si lo hubo) y el pago
+/// pendiente de regularización (si el alquiler salió offline, Caso E).
 async fn procesar_operacion(
     operacion: MensajeUsuarioAEstacion,
     ctx: ContextoOperacion,
-) -> (MensajeEstacionAUsuario, Option<Alquiler>) {
+) -> (
+    MensajeEstacionAUsuario,
+    Option<Alquiler>,
+    Option<PagoPendiente>,
+) {
     let ContextoOperacion {
         tx_id,
         rental_id,
@@ -1373,6 +1528,7 @@ async fn procesar_operacion(
                         motivo: format!("no existe el slot {slot_id}"),
                     },
                     None,
+                    None,
                 );
             };
 
@@ -1394,7 +1550,7 @@ async fn procesar_operacion(
                 let prepare = MensajeEstacionAPasarela::PreparePreauth {
                     tx_id: tx_id.clone(),
                     usuario_id: usuario_id.clone(),
-                    tarjeta,
+                    tarjeta: tarjeta.clone(),
                     monto_propuesto: MONTO_RESERVA,
                 };
                 // Caso A: si la pasarela no vota dentro del plazo, es un No
@@ -1461,18 +1617,28 @@ async fn procesar_operacion(
 
                 match bici {
                     Some(bici_id) => {
-                        if modo_offline {
+                        let inicio = Timestamp::ahora();
+                        // Caso E: el pago queda pendiente, con los datos para la
+                        // preauth diferida (incluida la tarjeta).
+                        let pago = modo_offline.then(|| {
                             println!(
                                 "[{estacion_origen}] alquiler de {bici_id} resuelto OFFLINE \
                                  (Caso E): preauth pendiente, sin reporte al líder"
                             );
-                        }
+                            PagoPendiente {
+                                rental_id: rental_id.clone(),
+                                bici_id,
+                                usuario_id: usuario_id.clone(),
+                                tarjeta: tarjeta.clone(),
+                                t0: inicio,
+                            }
+                        });
                         let alquiler = Alquiler {
                             rental_id: rental_id.clone(),
                             bici_id,
                             usuario_id,
                             estacion_origen,
-                            inicio: Timestamp::ahora(),
+                            inicio,
                             fin: None,
                             preauth_id: preauth_id.clone(),
                             estado: EstadoAlquiler::Activo,
@@ -1484,12 +1650,14 @@ async fn procesar_operacion(
                                 preauth_id,
                             },
                             Some(alquiler),
+                            pago,
                         )
                     }
                     None => (
                         MensajeEstacionAUsuario::AlquilerRechazado {
                             motivo: "el slot no liberó la bici".to_string(),
                         },
+                        None,
                         None,
                     ),
                 }
@@ -1520,7 +1688,11 @@ async fn procesar_operacion(
                 } else {
                     "la pasarela rechazó el pago o no respondió".to_string()
                 };
-                (MensajeEstacionAUsuario::AlquilerRechazado { motivo }, None)
+                (
+                    MensajeEstacionAUsuario::AlquilerRechazado { motivo },
+                    None,
+                    None,
+                )
             }
         }
 
@@ -1533,17 +1705,20 @@ async fn procesar_operacion(
                         motivo: format!("no existe el slot {slot_id}"),
                     },
                     None,
+                    None,
                 );
             };
             match slot.send(AceptarBici { bici_id }).await {
                 Ok(true) => (
                     MensajeEstacionAUsuario::DevolucionAceptada { bici_id },
                     None,
+                    None,
                 ),
                 _ => (
                     MensajeEstacionAUsuario::DevolucionRechazada {
                         motivo: format!("el slot {slot_id} está ocupado"),
                     },
+                    None,
                     None,
                 ),
             }
@@ -1559,10 +1734,13 @@ impl Handler<SolicitudUsuario> for Estacion {
         Box::pin(
             async move { procesar_operacion(msg.0, ctx).await }
                 .into_actor(self)
-                .map(|(respuesta, alquiler), actor, ctx| {
+                .map(|(respuesta, alquiler, pago), actor, ctx| {
                     if let Some(a) = alquiler {
                         actor.reportar_alquiler(&a, ctx);
                         actor.alquileres_propios.insert(a.rental_id.clone(), a);
+                        if let Some(pago) = pago {
+                            actor.pagos_pendientes.push(pago);
+                        }
                         actor.persistir();
                     }
                     if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta {
@@ -1628,28 +1806,34 @@ impl Handler<PaqueteRecibido> for Estacion {
                 let ctx = self.contexto(ctx);
                 Box::pin(
                     async move {
-                        let (respuesta, alquiler) = procesar_operacion(operacion, ctx).await;
-                        (respuesta, alquiler, responder)
+                        let (respuesta, alquiler, pago) = procesar_operacion(operacion, ctx).await;
+                        (respuesta, alquiler, pago, responder)
                     }
                     .into_actor(self)
-                    .map(|(respuesta, alquiler, responder), actor, ctx| {
-                        if let Some(a) = alquiler {
-                            actor.reportar_alquiler(&a, ctx);
-                            actor.alquileres_propios.insert(a.rental_id.clone(), a);
-                            actor.persistir();
-                        }
-                        if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta
-                        {
-                            ctx.address().do_send(ProcesarDevolucion {
-                                bici_id: *bici_id,
-                                t1: Timestamp::ahora(),
-                                ya_reprocesada: false,
-                            });
-                        }
-                        if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
-                            responder.responder(bytes);
-                        }
-                    }),
+                    .map(
+                        |(respuesta, alquiler, pago, responder), actor, ctx| {
+                            if let Some(a) = alquiler {
+                                actor.reportar_alquiler(&a, ctx);
+                                actor.alquileres_propios.insert(a.rental_id.clone(), a);
+                                if let Some(pago) = pago {
+                                    actor.pagos_pendientes.push(pago);
+                                }
+                                actor.persistir();
+                            }
+                            if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } =
+                                &respuesta
+                            {
+                                ctx.address().do_send(ProcesarDevolucion {
+                                    bici_id: *bici_id,
+                                    t1: Timestamp::ahora(),
+                                    ya_reprocesada: false,
+                                });
+                            }
+                            if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
+                                responder.responder(bytes);
+                            }
+                        },
+                    ),
                 )
             }
             _ => Box::pin(async {}.into_actor(self).map(|_, _, _| ())),
@@ -1732,7 +1916,13 @@ mod tests {
     /// Pasarela de mentira: escucha en un puerto efímero y responde a cada pedido
     /// con un voto fijo (Yes/No) y las confirmaciones de commit/abort.
     fn pasarela_mock(vota_si: bool) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        pasarela_mock_en("127.0.0.1:0".parse().unwrap(), vota_si)
+    }
+
+    /// Igual que `pasarela_mock` pero en una dirección fija: permite arrancar
+    /// el test con la pasarela "caída" y levantarla a mitad de camino.
+    fn pasarela_mock_en(addr: SocketAddr, vota_si: bool) -> SocketAddr {
+        let listener = TcpListener::bind(addr).unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for conexion in listener.incoming() {
@@ -2168,6 +2358,119 @@ mod tests {
             // Regla 7.1.1: sin preauth NO se reporta (ni al propio registro,
             // aunque esta estación sea el líder).
             assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
+        });
+    }
+
+    /// Estación líder con la pasarela en `pasarela` y los intervalos de
+    /// reintento/regularización acortados, para los tests del Caso E.
+    async fn arrancar_con_intervalos_cortos(pasarela: SocketAddr) -> Addr<Estacion> {
+        let lider = "127.0.0.1:9".parse().unwrap();
+        let s0 = Slot::con_bici(0, BiciId(41)).start();
+        let s1 = Slot::con_bici(1, BiciId(42)).start();
+        let estacion = Estacion::new(
+            EstacionId(1),
+            (0.0, 0.0),
+            vec![s0, s1],
+            pasarela,
+            (EstacionId(1), lider),
+            true,
+            HashMap::new(),
+        )
+        .con_intervalo_de_reintento(std::time::Duration::from_millis(300))
+        .con_intervalo_de_regularizacion(std::time::Duration::from_millis(300))
+        .start();
+        let comunicador = Comunicador::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            estacion.clone().recipient(),
+        )
+        .start();
+        estacion
+            .send(RegistrarComunicador(comunicador))
+            .await
+            .unwrap();
+        estacion
+    }
+
+    /// Deja a la estación en modo offline con un alquiler pendiente de pago:
+    /// primer alquiler falla (y marca a la pasarela caída), el segundo sale
+    /// por el Caso E.
+    async fn alquilar_offline(estacion: &Addr<Estacion>) {
+        let r1 = estacion.send(alquilar(0)).await.unwrap();
+        assert!(matches!(
+            r1,
+            MensajeEstacionAUsuario::AlquilerRechazado { .. }
+        ));
+        actix::clock::sleep(std::time::Duration::from_millis(300)).await;
+        let r2 = estacion.send(alquilar(1)).await.unwrap();
+        assert!(matches!(
+            r2,
+            MensajeEstacionAUsuario::AlquilerConfirmado {
+                preauth_id: None,
+                ..
+            }
+        ));
+        assert_eq!(estacion.send(ConsultarPagosPendientes).await.unwrap(), 1);
+        assert_eq!(
+            estacion.send(ConsultarRegistro).await.unwrap(),
+            0,
+            "offline: nada en el registro"
+        );
+    }
+
+    #[test]
+    fn alquiler_offline_se_regulariza_al_volver_la_pasarela() {
+        System::new().block_on(async {
+            let pasarela: SocketAddr = "127.0.0.1:18920".parse().unwrap();
+            let estacion = arrancar_con_intervalos_cortos(pasarela).await;
+            alquilar_offline(&estacion).await;
+
+            // Vuelve la pasarela: el re-sondeo la desmarca y la regularización
+            // consigue la preauth, reporta al líder y commitea.
+            let _viva = pasarela_mock_en(pasarela, true);
+            let mut listo = false;
+            for _ in 0..60 {
+                actix::clock::sleep(std::time::Duration::from_millis(300)).await;
+                let pagos = estacion.send(ConsultarPagosPendientes).await.unwrap();
+                let registro = estacion.send(ConsultarRegistro).await.unwrap();
+                let commits = estacion.send(ConsultarCommitsPendientes).await.unwrap();
+                if pagos == 0 && registro == 1 && commits == 0 {
+                    listo = true;
+                    break;
+                }
+            }
+            assert!(
+                listo,
+                "la regularización debería poner la preauth, reportar y commitear"
+            );
+            assert_eq!(estacion.send(ConsultarCobrosFallidos).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn regularizacion_rechazada_queda_como_cobro_fallido() {
+        System::new().block_on(async {
+            let pasarela: SocketAddr = "127.0.0.1:18921".parse().unwrap();
+            let estacion = arrancar_con_intervalos_cortos(pasarela).await;
+            alquilar_offline(&estacion).await;
+
+            // La pasarela vuelve... pero rechaza la tarjeta: CobroFallido.
+            let _viva = pasarela_mock_en(pasarela, false);
+            let mut fallidos = 0;
+            for _ in 0..60 {
+                actix::clock::sleep(std::time::Duration::from_millis(300)).await;
+                fallidos = estacion.send(ConsultarCobrosFallidos).await.unwrap();
+                if fallidos == 1 {
+                    break;
+                }
+            }
+            assert_eq!(fallidos, 1, "la regularización rechazada queda auditada");
+            assert_eq!(estacion.send(ConsultarPagosPendientes).await.unwrap(), 0);
+            assert_eq!(
+                estacion.send(ConsultarRegistro).await.unwrap(),
+                0,
+                "sin preauth no hay reporte al líder"
+            );
         });
     }
 

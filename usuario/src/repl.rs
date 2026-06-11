@@ -14,7 +14,7 @@ use comun::mensajes::usuario_estacion::{
 use comun::serializacion::desde_bytes;
 use comun::{Config, EstacionId};
 
-use crate::usuario::{EstadoUsuario, Usuario};
+use crate::usuario::{EstadoUsuario, ModoConectividad, Usuario};
 
 pub fn correr(mut usuario: Usuario, config: Config) {
     ayuda();
@@ -26,7 +26,15 @@ pub fn correr(mut usuario: Usuario, config: Config) {
             ["alquilar", est, slot] => alquilar(&mut usuario, &config, est, slot),
             ["devolver", est, slot] => devolver(&mut usuario, &config, est, slot),
             ["consultar", lat, lon, radio] => consultar(&usuario, &config, lat, lon, radio),
-            ["estado"] => println!("estado: {:?}", usuario.estado()),
+            ["desconectar"] => {
+                usuario.cambiar_modo(ModoConectividad::SoloLocal);
+                println!("modo SoloLocal: podés alquilar y devolver, pero no consultar");
+            }
+            ["conectar"] => {
+                usuario.cambiar_modo(ModoConectividad::Conectado);
+                println!("conectividad restablecida");
+            }
+            ["estado"] => println!("estado: {:?} (modo {:?})", usuario.estado(), usuario.modo()),
             ["ayuda"] => ayuda(),
             ["salir"] | ["exit"] => break,
             [] => {}
@@ -38,7 +46,7 @@ pub fn correr(mut usuario: Usuario, config: Config) {
 fn ayuda() {
     println!(
         "comandos: alquilar <estacion> <slot> | devolver <estacion> <slot> | \
-         consultar <lat> <lon> <radio_km> | estado | ayuda | salir"
+         consultar <lat> <lon> <radio_km> | desconectar | conectar | estado | ayuda | salir"
     );
 }
 
@@ -104,6 +112,12 @@ fn responder(usuario: &mut Usuario, addr: SocketAddr, pedido: &MensajeUsuario) {
 /// hace discovery del líder (le pregunta a cualquier estación conocida) y después
 /// le manda la consulta de disponibilidad al líder.
 fn consultar(usuario: &Usuario, config: &Config, lat: &str, lon: &str, radio: &str) {
+    // En SoloLocal no hay cómo llegar al líder: la consulta global no está
+    // disponible (alquilar y devolver contra una estación cercana, sí).
+    if usuario.modo() == ModoConectividad::SoloLocal {
+        println!("sin señal (SoloLocal): la consulta de disponibilidad no está disponible");
+        return;
+    }
     let (Ok(lat), Ok(lon), Ok(radio)) =
         (lat.parse::<f64>(), lon.parse::<f64>(), radio.parse::<f64>())
     else {
