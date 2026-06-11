@@ -8,6 +8,7 @@
 //! Es agnóstico del tipo de mensaje: trabaja con bytes. Quien recibe el
 //! `PaqueteRecibido` lo deserializa al tipo que corresponda.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, Sender};
@@ -92,6 +93,28 @@ pub struct EnviarTcpConfirmado {
     pub datos: Vec<u8>,
 }
 
+/// ¿La última operación TCP hacia `destino` anduvo? Una dirección que nunca se
+/// intentó se asume alcanzable. Lo usa la estación para decidir el modo
+/// desconectado (Caso E) sin pagar un timeout en el momento del alquiler.
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub struct ConsultarAlcanzable {
+    pub destino: SocketAddr,
+}
+
+/// Actualiza la marca de alcanzabilidad de una dirección. Lo usan los propios
+/// handlers del Comunicador (tras cada operación saliente) y el re-sondeo.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct MarcarAlcanzable {
+    pub destino: SocketAddr,
+    pub alcanzable: bool,
+}
+
+/// Cada cuánto el Comunicador re-sondea (conexión corta) las direcciones que
+/// tiene marcadas como inalcanzables, para detectar que volvieron.
+const INTERVALO_RESONDEO: Duration = Duration::from_secs(3);
+
 pub struct Comunicador {
     addr_tcp: SocketAddr,
     addr_udp: SocketAddr,
@@ -99,6 +122,9 @@ pub struct Comunicador {
     /// Socket UDP para enviar (clon del que usa el thread de recepción). Se
     /// inicializa en `started`.
     socket_udp: Option<UdpSocket>,
+    /// Servicios alcanzables, por dirección: el resultado de la última
+    /// operación TCP saliente hacia cada destino.
+    alcanzables: HashMap<SocketAddr, bool>,
 }
 
 impl Comunicador {
@@ -112,16 +138,44 @@ impl Comunicador {
             addr_udp,
             destino,
             socket_udp: None,
+            alcanzables: HashMap::new(),
         }
+    }
+
+    /// Re-sondea (conexión corta, en un thread) las direcciones marcadas como
+    /// inalcanzables; si alguna volvió, se desmarca. Así el Caso E termina solo
+    /// cuando la pasarela reaparece.
+    fn resondear(&self, ctx: &mut Context<Self>) {
+        let caidas: Vec<SocketAddr> = self
+            .alcanzables
+            .iter()
+            .filter(|(_, ok)| !**ok)
+            .map(|(addr, _)| *addr)
+            .collect();
+        if caidas.is_empty() {
+            return;
+        }
+        let yo = ctx.address();
+        thread::spawn(move || {
+            for destino in caidas {
+                if TcpStream::connect_timeout(&destino, Duration::from_millis(500)).is_ok() {
+                    yo.do_send(MarcarAlcanzable {
+                        destino,
+                        alcanzable: true,
+                    });
+                }
+            }
+        });
     }
 }
 
 impl Actor for Comunicador {
     type Context = Context<Self>;
 
-    fn started(&mut self, _ctx: &mut Self::Context) {
+    fn started(&mut self, ctx: &mut Self::Context) {
         escuchar_tcp(self.addr_tcp, self.destino.clone());
         self.socket_udp = Some(escuchar_udp(self.addr_udp, self.destino.clone()));
+        ctx.run_interval(INTERVALO_RESONDEO, |act, ctx| act.resondear(ctx));
     }
 }
 
@@ -147,16 +201,23 @@ impl Handler<EnviarUdp> for Comunicador {
 impl Handler<ConsultarTcp> for Comunicador {
     type Result = ResponseFuture<Option<Vec<u8>>>;
 
-    fn handle(&mut self, msg: ConsultarTcp, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: ConsultarTcp, ctx: &mut Self::Context) -> Self::Result {
         // El round-trip bloqueante se hace en un thread y acá solo se espera el
         // resultado, sin frenar al actor. Importa de verdad: si este handler
         // bloqueara el arbiter, dos procesos que se consultan mutuamente (p.ej.
         // el líder reconstruyendo el registro mientras un follower lo sondea)
         // quedarían esperándose para siempre.
+        let yo = ctx.address();
         Box::pin(async move {
-            en_thread(move || solicitar_tcp(msg.destino, &msg.datos).ok())
+            let destino = msg.destino;
+            let resultado = en_thread(move || solicitar_tcp(msg.destino, &msg.datos).ok())
                 .await
-                .flatten()
+                .flatten();
+            yo.do_send(MarcarAlcanzable {
+                destino,
+                alcanzable: resultado.is_some(),
+            });
+            resultado
         })
     }
 }
@@ -164,14 +225,48 @@ impl Handler<ConsultarTcp> for Comunicador {
 impl Handler<EnviarTcpConfirmado> for Comunicador {
     type Result = ResponseFuture<bool>;
 
-    fn handle(&mut self, msg: EnviarTcpConfirmado, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: EnviarTcpConfirmado, ctx: &mut Self::Context) -> Self::Result {
         // Mismo esquema que `ConsultarTcp`: el envío (con sus reintentos de
         // conexión) corre en un thread para no frenar al actor.
+        let yo = ctx.address();
         Box::pin(async move {
-            en_thread(move || enviar_tcp_confirmado(msg.destino, &msg.datos))
+            let destino = msg.destino;
+            let entregado = en_thread(move || enviar_tcp_confirmado(msg.destino, &msg.datos))
                 .await
-                .unwrap_or(false)
+                .unwrap_or(false);
+            yo.do_send(MarcarAlcanzable {
+                destino,
+                alcanzable: entregado,
+            });
+            entregado
         })
+    }
+}
+
+impl Handler<ConsultarAlcanzable> for Comunicador {
+    type Result = bool;
+
+    fn handle(&mut self, msg: ConsultarAlcanzable, _ctx: &mut Self::Context) -> bool {
+        *self.alcanzables.get(&msg.destino).unwrap_or(&true)
+    }
+}
+
+impl Handler<MarcarAlcanzable> for Comunicador {
+    type Result = ();
+
+    fn handle(&mut self, msg: MarcarAlcanzable, _ctx: &mut Self::Context) {
+        let anterior = self.alcanzables.insert(msg.destino, msg.alcanzable);
+        if anterior == Some(!msg.alcanzable) {
+            println!(
+                "[comunicador] {} pasó a {}",
+                msg.destino,
+                if msg.alcanzable {
+                    "alcanzable"
+                } else {
+                    "INALCANZABLE"
+                }
+            );
+        }
     }
 }
 
@@ -359,6 +454,59 @@ mod tests {
         fn handle(&mut self, msg: PaqueteRecibido, _ctx: &mut Self::Context) {
             let _ = self.tx.send((msg.transporte, msg.datos));
         }
+    }
+
+    #[test]
+    fn marca_inalcanzable_tras_fallar_y_se_recupera_con_el_resondeo() {
+        System::new().block_on(async {
+            let (tx, _rx) = mpsc::channel();
+            let comunicador = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                Sonda { tx }.start().recipient(),
+            )
+            .start();
+            let muerto: SocketAddr = "127.0.0.1:18900".parse().unwrap();
+
+            // Una dirección que nunca se intentó se asume alcanzable.
+            assert!(comunicador
+                .send(ConsultarAlcanzable { destino: muerto })
+                .await
+                .unwrap());
+
+            // Un envío fallido la marca inalcanzable.
+            let entregado = comunicador
+                .send(EnviarTcpConfirmado {
+                    destino: muerto,
+                    datos: b"hola".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert!(!entregado);
+            actix::clock::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !comunicador
+                    .send(ConsultarAlcanzable { destino: muerto })
+                    .await
+                    .unwrap(),
+                "tras el fallo queda marcada inalcanzable"
+            );
+
+            // El servicio "vuelve": el re-sondeo periódico la desmarca solo.
+            let _listener = TcpListener::bind(muerto).unwrap();
+            let mut alcanzable = false;
+            for _ in 0..30 {
+                actix::clock::sleep(Duration::from_millis(300)).await;
+                alcanzable = comunicador
+                    .send(ConsultarAlcanzable { destino: muerto })
+                    .await
+                    .unwrap();
+                if alcanzable {
+                    break;
+                }
+            }
+            assert!(alcanzable, "el re-sondeo debería detectar que volvió");
+        });
     }
 
     #[test]

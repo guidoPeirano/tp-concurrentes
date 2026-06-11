@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use actix::prelude::*;
 use comun::comunicador::{
-    Comunicador, ConsultarTcp, EnviarTcp, EnviarTcpConfirmado, EnviarUdp, PaqueteRecibido,
-    Responder, Transporte,
+    Comunicador, ConsultarAlcanzable, ConsultarTcp, EnviarTcp, EnviarTcpConfirmado, EnviarUdp,
+    PaqueteRecibido, Responder, Transporte,
 };
 use comun::mensajes::estacion_estacion::{MensajeEntreEstacionesTCP, MensajeEntreEstacionesUDP};
 use comun::mensajes::estacion_pasarela::{
@@ -301,6 +301,15 @@ impl Estacion {
     /// lo registra directo; si es follower, se lo manda por el Comunicador (con
     /// cola de diferidos si el líder no está disponible).
     fn reportar_alquiler(&mut self, alquiler: &Alquiler, ctx: &mut Context<Self>) {
+        // Regla de la 7.1.1: un alquiler sin preauth (modo offline) NO se
+        // reporta; primero se regulariza contra la pasarela.
+        let Some(preauth_id) = alquiler.preauth_id.clone() else {
+            println!(
+                "[{}] alquiler de {} sin preauth: pendiente de regularización",
+                self.id, alquiler.bici_id
+            );
+            return;
+        };
         let n = self.proximo();
         let abierto = MensajeEntreEstacionesTCP::AlquilerAbierto {
             event_id: EventId(format!("E-{}-{}", self.id.0, n)),
@@ -309,7 +318,7 @@ impl Estacion {
             usuario_id: alquiler.usuario_id.clone(),
             estacion_origen: alquiler.estacion_origen,
             t0: alquiler.inicio,
-            preauth_id: alquiler.preauth_id.clone(),
+            preauth_id,
         };
         match &mut self.rol {
             RolEstacion::Lider { registro, .. } => registro.agregar(alquiler.clone()),
@@ -459,6 +468,13 @@ impl Estacion {
         t1: Timestamp,
         ctx: &mut Context<Self>,
     ) {
+        // Un alquiler offline sin regularizar no tiene preauth: no se puede
+        // cobrar ni reportar todavía. Queda huérfana (en la práctica la
+        // regularización lo resuelve antes de que la bici se devuelva).
+        let Some(preauth_id) = alquiler.preauth_id.clone() else {
+            self.confirmar_huerfana(bici_id);
+            return;
+        };
         println!(
             "[{}] alquiler de {} recuperado (origen {}): re-reporto al líder y reproceso",
             self.id, bici_id, alquiler.estacion_origen
@@ -471,7 +487,7 @@ impl Estacion {
             usuario_id: alquiler.usuario_id.clone(),
             estacion_origen: alquiler.estacion_origen,
             t0: alquiler.inicio,
-            preauth_id: alquiler.preauth_id.clone(),
+            preauth_id,
         };
         if let RolEstacion::Lider { registro, .. } = &mut self.rol {
             registro.agregar(alquiler);
@@ -568,7 +584,7 @@ impl Estacion {
                             estacion_origen,
                             inicio: t0,
                             fin: None,
-                            preauth_id,
+                            preauth_id: Some(preauth_id),
                             estado: EstadoAlquiler::Activo,
                         });
                     }
@@ -579,11 +595,16 @@ impl Estacion {
             } => {
                 let respuesta = match &self.rol {
                     RolEstacion::Lider { registro, .. } => {
-                        match registro.buscar_por_bici(bici_id) {
-                            Some(a) => MensajeEntreEstacionesTCP::DatosParaCobro {
+                        // El registro solo guarda alquileres con preauth (regla
+                        // de la 7.1.1); el and_then es defensivo.
+                        match registro
+                            .buscar_por_bici(bici_id)
+                            .and_then(|a| a.preauth_id.clone().map(|p| (a, p)))
+                        {
+                            Some((a, preauth_id)) => MensajeEntreEstacionesTCP::DatosParaCobro {
                                 event_id,
                                 rental_id: a.rental_id.clone(),
-                                preauth_id: a.preauth_id.clone(),
+                                preauth_id,
                                 t0: a.inicio,
                                 estacion_origen: a.estacion_origen,
                             },
@@ -629,6 +650,8 @@ impl Estacion {
                     .alquileres_propios
                     .values()
                     .filter(|a| a.estado == EstadoAlquiler::Activo)
+                    // Sin preauth no entra al registro del líder (regla 7.1.1).
+                    .filter(|a| a.preauth_id.is_some())
                     .cloned()
                     .collect();
                 let respuesta = MensajeEntreEstacionesTCP::RespuestaAlquileres { alquileres };
@@ -1102,11 +1125,13 @@ impl Handler<ProcesarDevolucion> for Estacion {
         // si soy follower los consulto por red (más abajo).
         let es_lider = matches!(self.rol, RolEstacion::Lider { .. });
         let datos_si_lider = if let RolEstacion::Lider { registro, .. } = &self.rol {
-            registro.buscar_por_bici(msg.bici_id).map(|a| DatosCobro {
-                rental_id: a.rental_id.clone(),
-                preauth_id: a.preauth_id.clone(),
-                t0: a.inicio,
-                estacion_origen: a.estacion_origen,
+            registro.buscar_por_bici(msg.bici_id).and_then(|a| {
+                a.preauth_id.clone().map(|preauth_id| DatosCobro {
+                    rental_id: a.rental_id.clone(),
+                    preauth_id,
+                    t0: a.inicio,
+                    estacion_origen: a.estacion_origen,
+                })
             })
         } else {
             None
@@ -1217,6 +1242,20 @@ impl Handler<ProcesarDevolucion> for Estacion {
                 }
             }),
         )
+    }
+}
+
+/// ¿El Comunicador tiene a `destino` por alcanzable? (sin Comunicador: sí).
+async fn consultar_alcanzable(
+    comunicador: &Option<Addr<Comunicador>>,
+    destino: SocketAddr,
+) -> bool {
+    match comunicador {
+        Some(c) => c
+            .send(ConsultarAlcanzable { destino })
+            .await
+            .unwrap_or(true),
+        None => true,
     }
 }
 
@@ -1344,32 +1383,40 @@ async fn procesar_operacion(
                 })
                 .await
                 .unwrap_or(Voto::No);
-            let prepare = MensajeEstacionAPasarela::PreparePreauth {
-                tx_id: tx_id.clone(),
-                usuario_id: usuario_id.clone(),
-                tarjeta,
-                monto_propuesto: MONTO_RESERVA,
-            };
-            // Caso A: si la pasarela no vota dentro del plazo, es un No implícito
-            // (el alquiler se aborta y el slot conserva su bici).
-            let respuesta_pasarela = comun::tiempo::con_timeout(
-                TIMEOUT_PREPARE,
-                consultar_pasarela(&comunicador, pasarela, &prepare),
-            )
-            .await;
-            let hubo_timeout = respuesta_pasarela.is_none();
-            let (pasarela_ok, preauth_id) = match respuesta_pasarela.flatten() {
-                Some(MensajePasarelaAEstacion::Voto {
-                    resultado: VotoResultado::Yes,
-                    preauth_id: Some(id),
-                    ..
-                }) => (true, Some(id)),
-                _ => (false, None),
+            // Caso E: si el Comunicador ya marcó a la pasarela como
+            // inalcanzable, se la omite del 2PC: el alquiler se resuelve solo
+            // con el voto del Slot, sin preauth (queda pendiente) y sin
+            // reportarse al líder (regla de la 7.1.1).
+            let modo_offline = !consultar_alcanzable(&comunicador, pasarela).await;
+            let (pasarela_ok, preauth_id, hubo_timeout) = if modo_offline {
+                (true, None, false)
+            } else {
+                let prepare = MensajeEstacionAPasarela::PreparePreauth {
+                    tx_id: tx_id.clone(),
+                    usuario_id: usuario_id.clone(),
+                    tarjeta,
+                    monto_propuesto: MONTO_RESERVA,
+                };
+                // Caso A: si la pasarela no vota dentro del plazo, es un No
+                // implícito (se aborta y el slot conserva su bici).
+                let respuesta_pasarela = comun::tiempo::con_timeout(
+                    TIMEOUT_PREPARE,
+                    consultar_pasarela(&comunicador, pasarela, &prepare),
+                )
+                .await;
+                let hubo_timeout = respuesta_pasarela.is_none();
+                match respuesta_pasarela.flatten() {
+                    Some(MensajePasarelaAEstacion::Voto {
+                        resultado: VotoResultado::Yes,
+                        preauth_id: Some(id),
+                        ..
+                    }) => (true, Some(id), hubo_timeout),
+                    _ => (false, None, hubo_timeout),
+                }
             };
 
             // --- FASE DECISIÓN ---
             if voto_slot == Voto::Si && pasarela_ok {
-                let preauth_id = preauth_id.expect("un voto Yes siempre trae preauth_id");
                 let bici = slot
                     .send(CommitLiberacion {
                         tx_id: tx_id.clone(),
@@ -1377,37 +1424,49 @@ async fn procesar_operacion(
                     .await
                     .ok()
                     .flatten();
-                // Caso C: constancia (persistida) de la decisión ANTES de
-                // mandar el Commit. Si el proceso se cae acá en el medio, el
-                // reintento periódico lo completa al volver (la pasarela es
-                // idempotente al re-Commit).
-                let _ = yo
-                    .send(RegistrarCommitPendiente {
+                // El lado pasarela del commit solo existe si hubo preauth (en
+                // modo offline no hay nada que commitear allá).
+                if let Some(preauth) = &preauth_id {
+                    // Caso C: constancia (persistida) de la decisión ANTES de
+                    // mandar el Commit. Si el proceso se cae acá en el medio,
+                    // el reintento periódico lo completa al volver (la
+                    // pasarela es idempotente al re-Commit).
+                    let _ = yo
+                        .send(RegistrarCommitPendiente {
+                            tx_id: tx_id.clone(),
+                            preauth_id: preauth.clone(),
+                        })
+                        .await;
+                    let commit = MensajeEstacionAPasarela::CommitPreauth {
                         tx_id: tx_id.clone(),
-                        preauth_id: preauth_id.clone(),
-                    })
-                    .await;
-                let commit = MensajeEstacionAPasarela::CommitPreauth {
-                    tx_id: tx_id.clone(),
-                    preauth_id: preauth_id.clone(),
-                };
-                // También con plazo: una pasarela colgada acá no debe dejar al
-                // usuario esperando (el reintento se encarga después).
-                let respuesta_commit = comun::tiempo::con_timeout(
-                    TIMEOUT_PREPARE,
-                    consultar_pasarela(&comunicador, pasarela, &commit),
-                )
-                .await
-                .flatten();
-                if matches!(
-                    respuesta_commit,
-                    Some(MensajePasarelaAEstacion::PreauthConfirmada { .. })
-                ) {
-                    yo.do_send(CommitConfirmado { tx_id });
+                        preauth_id: preauth.clone(),
+                    };
+                    // También con plazo: una pasarela colgada acá no debe
+                    // dejar al usuario esperando (el reintento se encarga).
+                    let respuesta_commit = comun::tiempo::con_timeout(
+                        TIMEOUT_PREPARE,
+                        consultar_pasarela(&comunicador, pasarela, &commit),
+                    )
+                    .await
+                    .flatten();
+                    if matches!(
+                        respuesta_commit,
+                        Some(MensajePasarelaAEstacion::PreauthConfirmada { .. })
+                    ) {
+                        yo.do_send(CommitConfirmado {
+                            tx_id: tx_id.clone(),
+                        });
+                    }
                 }
 
                 match bici {
                     Some(bici_id) => {
+                        if modo_offline {
+                            println!(
+                                "[{estacion_origen}] alquiler de {bici_id} resuelto OFFLINE \
+                                 (Caso E): preauth pendiente, sin reporte al líder"
+                            );
+                        }
                         let alquiler = Alquiler {
                             rental_id: rental_id.clone(),
                             bici_id,
@@ -1743,7 +1802,11 @@ mod tests {
             let resp = estacion.send(alquilar(0)).await.unwrap();
             match resp {
                 MensajeEstacionAUsuario::AlquilerConfirmado { preauth_id, .. } => {
-                    assert_eq!(preauth_id, "P-mock", "la preauth la da la pasarela");
+                    assert_eq!(
+                        preauth_id.as_deref(),
+                        Some("P-mock"),
+                        "la preauth la da la pasarela"
+                    );
                 }
                 otro => panic!("esperaba AlquilerConfirmado, fue {otro:?}"),
             }
@@ -2072,6 +2135,39 @@ mod tests {
                 }
                 otra => panic!("esperaba RespuestaDisponibilidad, fue {otra:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn pasarela_inalcanzable_resuelve_el_alquiler_offline_sin_reportar() {
+        System::new().block_on(async {
+            // Pasarela muerta en un puerto fijo (nadie escucha).
+            let pasarela: SocketAddr = "127.0.0.1:18910".parse().unwrap();
+            let s0 = Slot::con_bici(0, BiciId(41)).start();
+            let s1 = Slot::con_bici(1, BiciId(42)).start();
+            let estacion = arrancar(vec![s0, s1], pasarela).await; // líder
+
+            // Primer intento: la pasarela todavía figura alcanzable, así que es
+            // un 2PC normal que falla (Caso A) → rechazo... y el Comunicador la
+            // marca inalcanzable.
+            let r1 = estacion.send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                r1,
+                MensajeEstacionAUsuario::AlquilerRechazado { .. }
+            ));
+            actix::clock::sleep(std::time::Duration::from_millis(300)).await;
+
+            // Segundo intento: Caso E. Confirmado sin preauth, solo con el Slot.
+            let r2 = estacion.send(alquilar(1)).await.unwrap();
+            match r2 {
+                MensajeEstacionAUsuario::AlquilerConfirmado { preauth_id, .. } => {
+                    assert_eq!(preauth_id, None, "offline: la preauth queda pendiente");
+                }
+                otro => panic!("esperaba AlquilerConfirmado offline, fue {otro:?}"),
+            }
+            // Regla 7.1.1: sin preauth NO se reporta (ni al propio registro,
+            // aunque esta estación sea el líder).
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
         });
     }
 
@@ -2483,7 +2579,7 @@ mod tests {
             match reply {
                 MensajeEntreEstacionesTCP::AlquilerEncontrado { alquiler, .. } => {
                     assert_eq!(alquiler.bici_id, BiciId(42));
-                    assert_eq!(alquiler.preauth_id, "P-mock");
+                    assert_eq!(alquiler.preauth_id.as_deref(), Some("P-mock"));
                 }
                 otro => panic!("esperaba AlquilerEncontrado, fue {otro:?}"),
             }

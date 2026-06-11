@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "actix",
  "comun",
+ "serde",
 ]
 
 [[package]]
@@ -226,6 +227,7 @@ version = "0.1.0"
 dependencies = [
  "actix",
  "comun",
+ "serde",
 ]
 
 [[package]]

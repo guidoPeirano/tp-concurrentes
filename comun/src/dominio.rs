@@ -14,7 +14,10 @@ pub struct Alquiler {
     pub estacion_origen: EstacionId,
     pub inicio: Timestamp,
     pub fin: Option<Timestamp>,
-    pub preauth_id: String,
+    /// `None` mientras el alquiler no obtuvo pre-autorización (alquiler
+    /// iniciado sin conectividad con la pasarela, Caso E). Un alquiler con
+    /// `None` NUNCA se reporta al líder (regla de la sección 7.1.1).
+    pub preauth_id: Option<String>,
     pub estado: EstadoAlquiler,
 }
 
