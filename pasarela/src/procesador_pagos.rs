@@ -6,6 +6,7 @@
 //! reprocesan. La persistencia en disco llega en la Etapa 6.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use actix::prelude::*;
 use comun::comunicador::PaqueteRecibido;
@@ -18,11 +19,17 @@ use comun::{DatosTarjeta, TransaccionId};
 use crate::mensajes::PedidoPasarela;
 use crate::tarifa::calcular_monto;
 
+/// Cuánto espera la pasarela la decisión (Commit/Abort) después de votar Sí,
+/// antes de anular la pre-autorización por su cuenta y liberar los fondos
+/// (Caso B de la sección 7.1.1 del README).
+const TIMEOUT_TRANSACCION: Duration = Duration::from_secs(10);
+
 pub struct ProcesadorPagos {
     /// Pre-autorizaciones por `preauth_id`.
     pre_autorizaciones: HashMap<String, PreAutorizacion>,
     tarifa: TarifaConfig,
     contador: u64,
+    timeout_transaccion: Duration,
 }
 
 struct PreAutorizacion {
@@ -45,7 +52,42 @@ impl ProcesadorPagos {
             pre_autorizaciones: HashMap::new(),
             tarifa,
             contador: 0,
+            timeout_transaccion: TIMEOUT_TRANSACCION,
         }
+    }
+
+    /// Cambia el plazo del Caso B (lo usan los tests para no esperar 10s).
+    /// Cuando los timeouts se levanten de la config, esto deja de ser solo de test.
+    #[cfg(test)]
+    pub fn con_timeout_de_transaccion(mut self, plazo: Duration) -> Self {
+        self.timeout_transaccion = plazo;
+        self
+    }
+
+    /// Si la respuesta fue un voto Sí (quedó una preauth `Preparada`), programa
+    /// el aborto unilateral del Caso B: al vencer el plazo, si la decisión
+    /// todavía no llegó, la preauth se anula y los fondos se liberan. Si en el
+    /// medio hubo Commit (`Activa`) o Abort (`Anulada`), el timer no hace nada.
+    fn programar_timeout(&self, respuesta: &MensajePasarelaAEstacion, ctx: &mut Context<Self>) {
+        let MensajePasarelaAEstacion::Voto {
+            resultado: VotoResultado::Yes,
+            preauth_id: Some(preauth_id),
+            ..
+        } = respuesta
+        else {
+            return;
+        };
+        let preauth_id = preauth_id.clone();
+        ctx.run_later(self.timeout_transaccion, move |pagos, _ctx| {
+            if let Some(pa) = pagos.pre_autorizaciones.get_mut(&preauth_id) {
+                if pa.estado == EstadoPreAuth::Preparada {
+                    pa.estado = EstadoPreAuth::Anulada;
+                    println!(
+                        "[pasarela] timeout de la preauth {preauth_id}: anulada, fondos liberados"
+                    );
+                }
+            }
+        });
     }
 
     fn nuevo_preauth_id(&mut self) -> String {
@@ -105,13 +147,23 @@ impl ProcesadorPagos {
             }
 
             MensajeEstacionAPasarela::CommitPreauth { preauth_id, .. } => {
-                if let Some(pa) = self.pre_autorizaciones.get_mut(&preauth_id) {
-                    // Idempotente: si ya estaba Activa, queda igual.
-                    if pa.estado == EstadoPreAuth::Preparada {
-                        pa.estado = EstadoPreAuth::Activa;
+                match self.pre_autorizaciones.get_mut(&preauth_id) {
+                    // Caso B: la preauth se anuló por timeout y el Commit llegó
+                    // tarde. No se puede confirmar: se informa que quedó anulada
+                    // (el coordinador reintentará con un 2PC nuevo).
+                    Some(pa) if pa.estado == EstadoPreAuth::Anulada => {
+                        MensajePasarelaAEstacion::PreauthAnulada { preauth_id }
                     }
+                    Some(pa) => {
+                        // Idempotente: si ya estaba Activa, queda igual.
+                        if pa.estado == EstadoPreAuth::Preparada {
+                            pa.estado = EstadoPreAuth::Activa;
+                        }
+                        MensajePasarelaAEstacion::PreauthConfirmada { preauth_id }
+                    }
+                    // Confirmar una preauth desconocida no tiene sentido.
+                    None => MensajePasarelaAEstacion::PreauthAnulada { preauth_id },
                 }
-                MensajePasarelaAEstacion::PreauthConfirmada { preauth_id }
             }
 
             MensajeEstacionAPasarela::AbortPreauth { preauth_id, .. } => {
@@ -123,6 +175,13 @@ impl ProcesadorPagos {
 
             MensajeEstacionAPasarela::ProcesarCobro { preauth_id, t0, t1 } => {
                 match self.pre_autorizaciones.get_mut(&preauth_id) {
+                    // Una preauth anulada (por Abort o por timeout) no se cobra.
+                    Some(pa) if pa.estado == EstadoPreAuth::Anulada => {
+                        MensajePasarelaAEstacion::CobroRechazado {
+                            preauth_id,
+                            motivo: "la pre-autorización está anulada".to_string(),
+                        }
+                    }
                     Some(pa) => {
                         // Idempotente: si ya se cobró, devolvemos el mismo monto.
                         if let EstadoPreAuth::Cobrada { monto_final } = pa.estado {
@@ -165,19 +224,22 @@ impl Actor for ProcesadorPagos {
 impl Handler<PedidoPasarela> for ProcesadorPagos {
     type Result = MessageResult<PedidoPasarela>;
 
-    fn handle(&mut self, msg: PedidoPasarela, _ctx: &mut Self::Context) -> Self::Result {
-        MessageResult(self.procesar(msg.0))
+    fn handle(&mut self, msg: PedidoPasarela, ctx: &mut Self::Context) -> Self::Result {
+        let respuesta = self.procesar(msg.0);
+        self.programar_timeout(&respuesta, ctx);
+        MessageResult(respuesta)
     }
 }
 
 impl Handler<PaqueteRecibido> for ProcesadorPagos {
     type Result = ();
 
-    fn handle(&mut self, msg: PaqueteRecibido, _ctx: &mut Self::Context) {
+    fn handle(&mut self, msg: PaqueteRecibido, ctx: &mut Self::Context) {
         let pedido: Option<MensajeEstacionAPasarela> =
             comun::serializacion::desde_bytes(&msg.datos).ok();
         if let (Some(pedido), Some(responder)) = (pedido, msg.responder) {
             let respuesta = self.procesar(pedido);
+            self.programar_timeout(&respuesta, ctx);
             if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
                 responder.responder(bytes);
             }
@@ -304,5 +366,88 @@ mod tests {
             } => id,
             otro => panic!("esperaba Voto con preauth_id, fue {otro:?}"),
         }
+    }
+
+    #[test]
+    fn preauth_preparada_se_anula_sola_por_timeout() {
+        System::new().block_on(async {
+            // Plazo corto para no esperar los 10s reales.
+            let p = ProcesadorPagos::new(tarifa())
+                .con_timeout_de_transaccion(Duration::from_millis(100))
+                .start();
+            let id = preauth_id(enviar(&p, prepare("T1", "123")).await);
+
+            // El coordinador "se cayó": no llega ni Commit ni Abort.
+            actix::clock::sleep(Duration::from_millis(200)).await;
+
+            // El Commit tardío no confirma: la preauth quedó anulada.
+            let commit = enviar(
+                &p,
+                Pedido::CommitPreauth {
+                    tx_id: TransaccionId("T1".to_string()),
+                    preauth_id: id.clone(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(commit, MensajePasarelaAEstacion::PreauthAnulada { .. }),
+                "esperaba PreauthAnulada, fue {commit:?}"
+            );
+
+            // Y por supuesto no se puede cobrar.
+            let cobro = enviar(
+                &p,
+                Pedido::ProcesarCobro {
+                    preauth_id: id,
+                    t0: Timestamp(0),
+                    t1: Timestamp(120_000),
+                },
+            )
+            .await;
+            assert!(
+                matches!(cobro, MensajePasarelaAEstacion::CobroRechazado { .. }),
+                "esperaba CobroRechazado, fue {cobro:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn el_commit_a_tiempo_evita_la_anulacion() {
+        System::new().block_on(async {
+            let p = ProcesadorPagos::new(tarifa())
+                .con_timeout_de_transaccion(Duration::from_millis(100))
+                .start();
+            let id = preauth_id(enviar(&p, prepare("T1", "123")).await);
+
+            // El Commit llega antes del plazo: la preauth queda Activa.
+            let commit = enviar(
+                &p,
+                Pedido::CommitPreauth {
+                    tx_id: TransaccionId("T1".to_string()),
+                    preauth_id: id.clone(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                commit,
+                MensajePasarelaAEstacion::PreauthConfirmada { .. }
+            ));
+
+            // El timer vence después y no la toca: el cobro sale normal.
+            actix::clock::sleep(Duration::from_millis(200)).await;
+            let cobro = enviar(
+                &p,
+                Pedido::ProcesarCobro {
+                    preauth_id: id,
+                    t0: Timestamp(0),
+                    t1: Timestamp(120_000),
+                },
+            )
+            .await;
+            assert!(
+                matches!(cobro, MensajePasarelaAEstacion::CobroConfirmado { monto, .. } if monto == 70.0),
+                "esperaba CobroConfirmado de 70, fue {cobro:?}"
+            );
+        });
     }
 }
