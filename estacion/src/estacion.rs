@@ -26,7 +26,8 @@ use comun::mensajes::usuario_estacion::{
     MensajeUsuarioAEstacion, MensajeUsuarioAEstacionConsulta,
 };
 use comun::{
-    Alquiler, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId, Timestamp, TransaccionId,
+    Alquiler, BiciId, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId, Timestamp,
+    TransaccionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,9 +63,9 @@ const INTERVALO_REINTENTO_COMMITS: std::time::Duration = std::time::Duration::fr
 use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitConfirmado, CommitLiberacion, ConsultarCache,
-    ConsultarCommitsPendientes, ConsultarEstado, ConsultarLider, ConsultarPendientes,
-    ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion, RegistrarCommitPendiente,
-    RegistrarComunicador, SolicitudUsuario, Voto,
+    ConsultarCommitsPendientes, ConsultarEstado, ConsultarHuerfanas, ConsultarLider,
+    ConsultarPendientes, ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion,
+    RegistrarCommitPendiente, RegistrarComunicador, SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -143,6 +144,8 @@ pub struct Estacion {
     archivo: Option<PathBuf>,
     /// Cada cuánto reintentar los commits pendientes (acortable en tests).
     intervalo_reintento_commits: std::time::Duration,
+    /// Bicis confirmadas huérfanas (auditoría, sección 8.2.1).
+    huerfanas_confirmadas: usize,
 }
 
 /// Lo que la estación guarda en disco: sus alquileres, los commits decididos
@@ -190,6 +193,7 @@ impl Estacion {
             commits_pendientes: HashMap::new(),
             archivo: None,
             intervalo_reintento_commits: INTERVALO_REINTENTO_COMMITS,
+            huerfanas_confirmadas: 0,
         }
     }
 
@@ -376,6 +380,124 @@ impl Estacion {
         }
     }
 
+    /// Recuperación de bicis huérfanas (8.2.1): el líder no encontró el alquiler
+    /// de `bici_id`, así que le preguntamos a cada estación si el alquiler
+    /// activo es suyo (`BuscarAlquilerPropio`). Si aparece, se re-reporta al
+    /// líder y la devolución se reprocesa; si nadie lo tiene, la bici queda
+    /// confirmada huérfana.
+    fn buscar_alquiler_huerfano(
+        &mut self,
+        bici_id: BiciId,
+        t1: Timestamp,
+        ctx: &mut Context<Self>,
+    ) {
+        // Primero en casa: puede ser un alquiler propio que el líder perdió.
+        let propio = self
+            .alquileres_propios
+            .values()
+            .find(|a| a.bici_id == bici_id && a.estado == EstadoAlquiler::Activo)
+            .cloned();
+        if let Some(alquiler) = propio {
+            self.recuperar_huerfana(alquiler, bici_id, t1, ctx);
+            return;
+        }
+        let n = self.proximo();
+        let event_id = EventId(format!("E-{}-{}", self.id.0, n));
+        let otras: Vec<SocketAddr> = self
+            .estaciones
+            .iter()
+            .filter(|(id, _)| **id != self.id)
+            .map(|(_, addr)| *addr)
+            .collect();
+        let comunicador = self.comunicador.clone();
+        println!(
+            "[{}] {} no tiene alquiler en el líder: busco a su dueño en las demás estaciones",
+            self.id, bici_id
+        );
+        let fut = async move {
+            let (Some(comunicador), Ok(bytes)) = (
+                comunicador,
+                comun::serializacion::a_bytes(&MensajeEntreEstacionesTCP::BuscarAlquilerPropio {
+                    event_id,
+                    bici_id,
+                }),
+            ) else {
+                return None;
+            };
+            for destino in otras {
+                let respuesta = comunicador
+                    .send(ConsultarTcp {
+                        destino,
+                        datos: bytes.clone(),
+                    })
+                    .await;
+                if let Ok(Some(datos)) = respuesta {
+                    if let Ok(MensajeEntreEstacionesTCP::AlquilerEncontrado { alquiler, .. }) =
+                        comun::serializacion::desde_bytes(&datos)
+                    {
+                        return Some(alquiler);
+                    }
+                }
+            }
+            None
+        }
+        .into_actor(self)
+        .map(move |encontrado, actor, ctx| match encontrado {
+            Some(alquiler) => actor.recuperar_huerfana(alquiler, bici_id, t1, ctx),
+            None => actor.confirmar_huerfana(bici_id),
+        });
+        ctx.spawn(fut);
+    }
+
+    /// Resultado 1 de la 8.2.1 (recuperación automática): el alquiler apareció
+    /// en alguna estación. Se re-reporta al líder (evento nuevo, con cola y
+    /// dedup) y la devolución se reprocesa una única vez.
+    fn recuperar_huerfana(
+        &mut self,
+        alquiler: Alquiler,
+        bici_id: BiciId,
+        t1: Timestamp,
+        ctx: &mut Context<Self>,
+    ) {
+        println!(
+            "[{}] alquiler de {} recuperado (origen {}): re-reporto al líder y reproceso",
+            self.id, bici_id, alquiler.estacion_origen
+        );
+        let n = self.proximo();
+        let evento = MensajeEntreEstacionesTCP::AlquilerAbierto {
+            event_id: EventId(format!("E-{}-{}", self.id.0, n)),
+            rental_id: alquiler.rental_id.clone(),
+            bici_id: alquiler.bici_id,
+            usuario_id: alquiler.usuario_id.clone(),
+            estacion_origen: alquiler.estacion_origen,
+            t0: alquiler.inicio,
+            preauth_id: alquiler.preauth_id.clone(),
+        };
+        if let RolEstacion::Lider { registro, .. } = &mut self.rol {
+            registro.agregar(alquiler);
+        } else {
+            self.enviar_evento_al_lider(evento, ctx);
+        }
+        ctx.address().do_send(ProcesarDevolucion {
+            bici_id,
+            t1,
+            ya_reprocesada: true,
+        });
+    }
+
+    /// Resultado 2 de la 8.2.1 (huérfana confirmada): nadie reconoce el
+    /// alquiler. La bici queda asegurada en el slot, disponible para alquilarse,
+    /// y no se cobra nada (no hay pre-autorización asociada). Queda en el log
+    /// para auditoría.
+    fn confirmar_huerfana(&mut self, bici_id: BiciId) {
+        self.huerfanas_confirmadas += 1;
+        println!(
+            "[{}] AUDITORÍA: {} confirmada huérfana (sin alquiler en ninguna estación); \
+             queda disponible, sin cobro",
+            self.id, bici_id
+        );
+    }
+
     /// Responde una consulta del usuario (CU3): discovery del líder o
     /// disponibilidad. La disponibilidad solo la puede contestar el líder (es el
     /// único con la cache); un follower devuelve la lista vacía.
@@ -510,6 +632,27 @@ impl Estacion {
                     .cloned()
                     .collect();
                 let respuesta = MensajeEntreEstacionesTCP::RespuestaAlquileres { alquileres };
+                if let (Some(r), Ok(bytes)) = (responder, comun::serializacion::a_bytes(&respuesta))
+                {
+                    r.responder(bytes);
+                }
+            }
+
+            // --- CU2 (recuperación): manejo de bicis huérfanas (8.2.1) ---
+            MensajeEntreEstacionesTCP::BuscarAlquilerPropio { event_id, bici_id } => {
+                // Otra estación busca al dueño de una bici sin alquiler en el
+                // líder: si el alquiler activo es mío, se lo paso.
+                let respuesta = match self
+                    .alquileres_propios
+                    .values()
+                    .find(|a| a.bici_id == bici_id && a.estado == EstadoAlquiler::Activo)
+                {
+                    Some(a) => MensajeEntreEstacionesTCP::AlquilerEncontrado {
+                        event_id,
+                        alquiler: a.clone(),
+                    },
+                    None => MensajeEntreEstacionesTCP::NoLoTengo { event_id, bici_id },
+                };
                 if let (Some(r), Ok(bytes)) = (responder, comun::serializacion::a_bytes(&respuesta))
                 {
                     r.responder(bytes);
@@ -919,6 +1062,14 @@ impl Handler<CommitConfirmado> for Estacion {
     }
 }
 
+impl Handler<ConsultarHuerfanas> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarHuerfanas, _ctx: &mut Self::Context) -> usize {
+        self.huerfanas_confirmadas
+    }
+}
+
 impl Handler<ConsultarCommitsPendientes> for Estacion {
     type Result = usize;
 
@@ -966,6 +1117,7 @@ impl Handler<ProcesarDevolucion> for Estacion {
         let mi_id = self.id;
         let bici_id = msg.bici_id;
         let t1 = msg.t1;
+        let ya_reprocesada = msg.ya_reprocesada;
         let n = self.proximo();
         let event_id = EventId(format!("E-{}-{}", self.id.0, n));
 
@@ -1013,7 +1165,15 @@ impl Handler<ProcesarDevolucion> for Estacion {
             .into_actor(self)
             .map(move |resultado, actor, ctx| {
                 let Some((datos, monto, event_id)) = resultado else {
-                    return; // Agotados los reintentos: bici huérfana (PR de la 8.2.1).
+                    // Agotados los reintentos: protocolo de huérfanas (8.2.1).
+                    // Si esto ya era el reproceso post-recuperación, se confirma
+                    // huérfana directo (sin buscar de nuevo: evita el loop).
+                    if ya_reprocesada {
+                        actor.confirmar_huerfana(bici_id);
+                    } else {
+                        actor.buscar_alquiler_huerfano(bici_id, t1, ctx);
+                    }
+                    return;
                 };
                 let tiempo = datos.t0.minutos_hasta(t1);
 
@@ -1350,6 +1510,7 @@ impl Handler<SolicitudUsuario> for Estacion {
                         ctx.address().do_send(ProcesarDevolucion {
                             bici_id: *bici_id,
                             t1: Timestamp::ahora(),
+                            ya_reprocesada: false,
                         });
                     }
                     respuesta
@@ -1423,6 +1584,7 @@ impl Handler<PaqueteRecibido> for Estacion {
                             ctx.address().do_send(ProcesarDevolucion {
                                 bici_id: *bici_id,
                                 t1: Timestamp::ahora(),
+                                ya_reprocesada: false,
                             });
                         }
                         if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
@@ -2295,6 +2457,305 @@ mod tests {
                 }
             }
             assert_eq!(pendientes, 0, "el reintento debe completar el commit");
+        });
+    }
+
+    #[test]
+    fn responde_si_tiene_el_alquiler_de_la_bici_buscada() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = arrancar(vec![s0], pasarela).await;
+            let _ = estacion.send(alquilar(0)).await.unwrap(); // propio: bici 42
+
+            // Bici alquilada acá: AlquilerEncontrado con el alquiler completo.
+            let (responder, rx) = Responder::canal();
+            let buscar = MensajeEntreEstacionesTCP::BuscarAlquilerPropio {
+                event_id: EventId("E-b1".to_string()),
+                bici_id: BiciId(42),
+            };
+            estacion
+                .send(paquete_tcp(&buscar, Some(responder)))
+                .await
+                .unwrap();
+            let reply: MensajeEntreEstacionesTCP =
+                comun::serializacion::desde_bytes(&rx.recv().unwrap()).unwrap();
+            match reply {
+                MensajeEntreEstacionesTCP::AlquilerEncontrado { alquiler, .. } => {
+                    assert_eq!(alquiler.bici_id, BiciId(42));
+                    assert_eq!(alquiler.preauth_id, "P-mock");
+                }
+                otro => panic!("esperaba AlquilerEncontrado, fue {otro:?}"),
+            }
+
+            // Bici desconocida: NoLoTengo.
+            let (responder, rx) = Responder::canal();
+            let buscar = MensajeEntreEstacionesTCP::BuscarAlquilerPropio {
+                event_id: EventId("E-b2".to_string()),
+                bici_id: BiciId(99),
+            };
+            estacion
+                .send(paquete_tcp(&buscar, Some(responder)))
+                .await
+                .unwrap();
+            let reply: MensajeEntreEstacionesTCP =
+                comun::serializacion::desde_bytes(&rx.recv().unwrap()).unwrap();
+            assert!(matches!(reply, MensajeEntreEstacionesTCP::NoLoTengo { .. }));
+        });
+    }
+
+    #[test]
+    fn bici_sin_alquiler_en_ningun_lado_se_confirma_huerfana() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            // Follower aislado: líder muerto y ninguna otra estación conocida.
+            let muerto: SocketAddr = "127.0.0.1:19049".parse().unwrap();
+            let estaciones: HashMap<EstacionId, SocketAddr> =
+                [(EstacionId(9), muerto)].into_iter().collect();
+            let s0 = Slot::nuevo(0).start();
+            let estacion = Estacion::new(
+                EstacionId(2),
+                (0.0, 0.0),
+                vec![s0],
+                pasarela,
+                (EstacionId(9), muerto),
+                false,
+                estaciones,
+            )
+            .start();
+            let comunicador = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                estacion.clone().recipient(),
+            )
+            .start();
+            estacion
+                .send(RegistrarComunicador(comunicador))
+                .await
+                .unwrap();
+
+            // Llega una bici que nadie alquiló.
+            let resp = estacion
+                .send(SolicitudUsuario(
+                    MensajeUsuarioAEstacion::SolicitudDevolucion {
+                        usuario_id: UsuarioId("alice".to_string()),
+                        bici_id: BiciId(99),
+                        rental_id: RentalId("R-fantasma".to_string()),
+                        slot_id: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::DevolucionAceptada { .. }
+            ));
+
+            // Reintentos al líder muerto + búsqueda sin candidatos → huérfana.
+            let mut huerfanas = 0;
+            for _ in 0..60 {
+                actix::clock::sleep(std::time::Duration::from_millis(250)).await;
+                huerfanas = estacion.send(ConsultarHuerfanas).await.unwrap();
+                if huerfanas == 1 {
+                    break;
+                }
+            }
+            assert_eq!(huerfanas, 1, "la bici debería confirmarse huérfana");
+        });
+    }
+
+    /// Líder con memoria para el camino feliz de la 8.2.1: arranca sin saber
+    /// nada (responde `NoRegistradoAun`), aprende el alquiler cuando alguien le
+    /// manda `AlquilerAbierto`, y a partir de ahí sirve `DatosParaCobro`. El
+    /// `DevolucionProcesada` final se vuelca al canal.
+    fn lider_mock_recuperable() -> (
+        SocketAddr,
+        std::sync::mpsc::Receiver<MensajeEntreEstacionesTCP>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        /// Lo que el líder de mentira recuerda de un `AlquilerAbierto`.
+        type AlquilerGuardado = (BiciId, RentalId, String, Timestamp, EstacionId);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registro: Arc<Mutex<Option<AlquilerGuardado>>> = Arc::new(Mutex::new(None));
+        std::thread::spawn(move || {
+            for conexion in listener.incoming() {
+                let Ok(mut stream) = conexion else { continue };
+                let registro = Arc::clone(&registro);
+                let tx = tx.clone();
+                let mi_addr = addr;
+                std::thread::spawn(move || {
+                    let mut desen = Desenmarcador::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        desen.alimentar(&buf[..n]);
+                        while let Some(payload) = desen.siguiente_payload() {
+                            if let Ok(msg) = comun::serializacion::desde_bytes::<
+                                MensajeEntreEstacionesTCP,
+                            >(&payload)
+                            {
+                                match msg {
+                                    MensajeEntreEstacionesTCP::AlquilerAbierto {
+                                        bici_id,
+                                        rental_id,
+                                        preauth_id,
+                                        t0,
+                                        estacion_origen,
+                                        ..
+                                    } => {
+                                        *registro.lock().unwrap() = Some((
+                                            bici_id,
+                                            rental_id,
+                                            preauth_id,
+                                            t0,
+                                            estacion_origen,
+                                        ));
+                                    }
+                                    MensajeEntreEstacionesTCP::NotificarDevolucion {
+                                        event_id,
+                                        bici_id,
+                                        ..
+                                    } => {
+                                        let guardado = registro.lock().unwrap().clone();
+                                        let resp = match guardado {
+                                            Some((bici, rental, preauth, t0, origen))
+                                                if bici == bici_id =>
+                                            {
+                                                MensajeEntreEstacionesTCP::DatosParaCobro {
+                                                    event_id,
+                                                    rental_id: rental,
+                                                    preauth_id: preauth,
+                                                    t0,
+                                                    estacion_origen: origen,
+                                                }
+                                            }
+                                            _ => MensajeEntreEstacionesTCP::NoRegistradoAun {
+                                                event_id,
+                                            },
+                                        };
+                                        let _ = stream.write_all(&enmarcar(&resp).unwrap());
+                                    }
+                                    otro => {
+                                        let _ = tx.send(otro);
+                                    }
+                                }
+                            } else if comun::serializacion::desde_bytes::<MensajeUsuario>(&payload)
+                                .is_ok()
+                            {
+                                let resp = MensajeEstacionAUsuarioConsulta::RespuestaLider {
+                                    lider_id: EstacionId(9),
+                                    lider_addr: mi_addr,
+                                    term: 0,
+                                };
+                                let _ = stream.write_all(&enmarcar(&resp).unwrap());
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    /// Camino feliz de la 8.2.1: la bici llega a B, el líder no la conoce, B la
+    /// encuentra en A (la estación de origen), re-reporta el alquiler y la
+    /// devolución termina cobrando y cerrando con normalidad.
+    #[test]
+    fn bici_huerfana_se_recupera_de_la_estacion_de_origen() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let (lider_addr, eventos) = lider_mock_recuperable();
+            let addr_a: SocketAddr = "127.0.0.1:19051".parse().unwrap();
+            let muerto: SocketAddr = "127.0.0.1:19059".parse().unwrap();
+
+            // A (origen): su "líder" está muerto, así que su AlquilerAbierto
+            // queda en la cola de diferidos y el líder real nunca se entera.
+            let estaciones_a: HashMap<EstacionId, SocketAddr> =
+                [(EstacionId(9), muerto)].into_iter().collect();
+            let s_a = Slot::con_bici(0, BiciId(42)).start();
+            let a = Estacion::new(
+                EstacionId(1),
+                (0.0, 0.0),
+                vec![s_a],
+                pasarela,
+                (EstacionId(9), muerto),
+                false,
+                estaciones_a,
+            )
+            .start();
+            let com_a = Comunicador::new(addr_a, addr_a, a.clone().recipient()).start();
+            a.send(RegistrarComunicador(com_a)).await.unwrap();
+            let resp = a.send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::AlquilerConfirmado { .. }
+            ));
+
+            // B (destino): su líder es el mock, que no conoce el alquiler.
+            // Conoce a A, así que la búsqueda de huérfanas la va a encontrar.
+            let estaciones_b: HashMap<EstacionId, SocketAddr> =
+                [(EstacionId(1), addr_a), (EstacionId(9), lider_addr)]
+                    .into_iter()
+                    .collect();
+            let s_b = Slot::nuevo(0).start();
+            let b = Estacion::new(
+                EstacionId(2),
+                (0.0, 0.0),
+                vec![s_b],
+                pasarela,
+                (EstacionId(9), lider_addr),
+                false,
+                estaciones_b,
+            )
+            .start();
+            let com_b = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                b.clone().recipient(),
+            )
+            .start();
+            b.send(RegistrarComunicador(com_b)).await.unwrap();
+
+            // El usuario devuelve la bici 42 en B.
+            let resp = b
+                .send(SolicitudUsuario(
+                    MensajeUsuarioAEstacion::SolicitudDevolucion {
+                        usuario_id: UsuarioId("alice".to_string()),
+                        bici_id: BiciId(42),
+                        rental_id: RentalId("ignorado".to_string()),
+                        slot_id: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::DevolucionAceptada { .. }
+            ));
+
+            // Retries → NoRegistradoAun → búsqueda → A lo tiene → re-reporte →
+            // reproceso → cobro → DevolucionProcesada en el líder.
+            let mut recibido = None;
+            for _ in 0..100 {
+                if let Ok(msg) = eventos.try_recv() {
+                    if matches!(msg, MensajeEntreEstacionesTCP::DevolucionProcesada { .. }) {
+                        recibido = Some(msg);
+                        break;
+                    }
+                }
+                actix::clock::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert!(
+                recibido.is_some(),
+                "la devolución debería completarse tras recuperar la huérfana"
+            );
+            // Y B no la contó como huérfana confirmada (se recuperó).
+            assert_eq!(b.send(ConsultarHuerfanas).await.unwrap(), 0);
         });
     }
 
