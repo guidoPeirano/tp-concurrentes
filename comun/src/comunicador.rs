@@ -305,13 +305,21 @@ fn enviar_tcp_confirmado(destino: SocketAddr, datos: &[u8]) -> bool {
     false
 }
 
+/// Cuánto espera `solicitar_tcp` la respuesta antes de dar la consulta por
+/// fallida. Sin esto, un proceso colgado (vivo pero que no responde) dejaría la
+/// consulta esperando para siempre; con esto, el que consulta recibe `None` y
+/// reacciona (p.ej. la vigilancia del líder lo da por caído).
+const TIMEOUT_LECTURA_TCP: Duration = Duration::from_secs(5);
+
 /// Cliente TCP request-response: conecta, manda un payload enmarcado y devuelve
-/// la respuesta (también enmarcada) por la misma conexión. Es **bloqueante**.
-/// Interno del Comunicador: lo usa el handler de `ConsultarTcp`.
+/// la respuesta (también enmarcada) por la misma conexión. Es **bloqueante**
+/// (corre en un thread, ver `en_thread`) pero acotado: la lectura vence a los
+/// `TIMEOUT_LECTURA_TCP`. Interno del Comunicador: lo usa `ConsultarTcp`.
 fn solicitar_tcp(destino: SocketAddr, datos: &[u8]) -> std::io::Result<Vec<u8>> {
     let frame = enmarcar_payload(datos)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut stream = TcpStream::connect(destino)?;
+    stream.set_read_timeout(Some(TIMEOUT_LECTURA_TCP))?;
     stream.write_all(&frame)?;
 
     let mut desenmarcador = Desenmarcador::new();
