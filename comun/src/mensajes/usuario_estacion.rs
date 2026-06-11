@@ -31,11 +31,12 @@ pub enum MensajeUsuarioAEstacion {
         slot_id: u32,
         tarjeta: DatosTarjeta,
     },
-    /// CU2 — la estación asegura la bici y avisa al líder.
+    /// CU2 — el usuario se acerca a un slot vacío y devuelve la bici ahí.
     SolicitudDevolucion {
         usuario_id: UsuarioId,
         bici_id: BiciId,
         rental_id: RentalId,
+        slot_id: u32,
     },
 }
 
@@ -51,6 +52,8 @@ pub enum MensajeEstacionAUsuario {
     AlquilerRechazado { motivo: String },
     /// CU2 — bici asegurada en el slot; el usuario ya puede irse.
     DevolucionAceptada { bici_id: BiciId },
+    /// CU2 — no se pudo asegurar la bici (slot ocupado o inexistente).
+    DevolucionRechazada { motivo: String },
     /// CU2 — el líder cerró el alquiler y la pasarela cobró.
     DevolucionCompletada {
         rental_id: RentalId,

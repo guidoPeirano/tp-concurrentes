@@ -1,7 +1,7 @@
-//! Binario del cliente de usuario (no usa actores). Etapa 0: parsea la config,
-//! arma el cliente y lista las estaciones conocidas. La REPL interactiva se
-//! agrega en la Etapa 2.
+//! Binario del cliente de usuario (no usa actores). Parsea la config, arma el
+//! cliente y entra a la REPL para alquilar/devolver contra las estaciones por TCP.
 
+mod repl;
 mod usuario;
 
 use std::error::Error;
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let usuario = Usuario::new(UsuarioId(id_arg));
 
     println!(
-        "[usuario {:?}] topología cargada: {} estaciones conocidas",
+        "[usuario {:?}] {} estaciones conocidas",
         usuario.id(),
         config.estaciones.len()
     );
@@ -30,6 +30,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    println!("(REPL interactiva pendiente — Etapa 2)");
+    repl::correr(usuario, config);
     Ok(())
 }
