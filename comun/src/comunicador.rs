@@ -82,6 +82,16 @@ pub struct ConsultarTcp {
     pub datos: Vec<u8>,
 }
 
+/// Como `EnviarTcp`, pero responde si la conexión y el envío salieron bien. Lo
+/// usa el Ring de elección para cerrar el anillo ante caídas: si el siguiente
+/// nodo no acepta la conexión, el que reenvía prueba con el que le sigue.
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub struct EnviarTcpConfirmado {
+    pub destino: SocketAddr,
+    pub datos: Vec<u8>,
+}
+
 pub struct Comunicador {
     addr_tcp: SocketAddr,
     addr_udp: SocketAddr,
@@ -135,11 +145,59 @@ impl Handler<EnviarUdp> for Comunicador {
 }
 
 impl Handler<ConsultarTcp> for Comunicador {
-    type Result = MessageResult<ConsultarTcp>;
+    type Result = ResponseFuture<Option<Vec<u8>>>;
 
     fn handle(&mut self, msg: ConsultarTcp, _ctx: &mut Self::Context) -> Self::Result {
-        // Round-trip bloqueante; el destino es otro proceso (no hay deadlock).
-        MessageResult(solicitar_tcp(msg.destino, &msg.datos).ok())
+        // El round-trip bloqueante se hace en un thread y acá solo se espera el
+        // resultado, sin frenar al actor. Importa de verdad: si este handler
+        // bloqueara el arbiter, dos procesos que se consultan mutuamente (p.ej.
+        // el líder reconstruyendo el registro mientras un follower lo sondea)
+        // quedarían esperándose para siempre.
+        Box::pin(async move {
+            en_thread(move || solicitar_tcp(msg.destino, &msg.datos).ok())
+                .await
+                .flatten()
+        })
+    }
+}
+
+impl Handler<EnviarTcpConfirmado> for Comunicador {
+    type Result = ResponseFuture<bool>;
+
+    fn handle(&mut self, msg: EnviarTcpConfirmado, _ctx: &mut Self::Context) -> Self::Result {
+        // Mismo esquema que `ConsultarTcp`: el envío (con sus reintentos de
+        // conexión) corre en un thread para no frenar al actor.
+        Box::pin(async move {
+            en_thread(move || enviar_tcp_confirmado(msg.destino, &msg.datos))
+                .await
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// Corre `trabajo` (bloqueante) en un thread y devuelve un futuro await-able con
+/// su resultado, sin bloquear el thread del actor. El puente es un canal de la
+/// std consultado con `try_recv` + sleeps cortos (sin crates async extra).
+/// Devuelve `None` si el thread murió sin responder.
+fn en_thread<T, F>(trabajo: F) -> impl std::future::Future<Output = Option<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(trabajo());
+    });
+    async move {
+        loop {
+            match rx.try_recv() {
+                Ok(resultado) => return Some(resultado),
+                Err(mpsc::TryRecvError::Disconnected) => return None,
+                Err(mpsc::TryRecvError::Empty) => {
+                    actix::clock::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
     }
 }
 
@@ -226,6 +284,25 @@ fn enviar_tcp(destino: SocketAddr, datos: &[u8]) {
         thread::sleep(Duration::from_millis(50));
     }
     eprintln!("[comunicador] no pude conectar a {destino} para enviar por TCP");
+}
+
+/// Conecta y envía un payload enmarcado, informando si se pudo entregar. Menos
+/// reintentos que `enviar_tcp`: acá el que llama quiere un veredicto rápido para
+/// probar con otro destino (el par de reintentos tolera un listener que recién
+/// está levantando).
+fn enviar_tcp_confirmado(destino: SocketAddr, datos: &[u8]) -> bool {
+    let Ok(frame) = enmarcar_payload(datos) else {
+        return false;
+    };
+    for intento in 0..3 {
+        if intento > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if let Ok(mut stream) = TcpStream::connect(destino) {
+            return stream.write_all(&frame).is_ok();
+        }
+    }
+    false
 }
 
 /// Cliente TCP request-response: conecta, manda un payload enmarcado y devuelve

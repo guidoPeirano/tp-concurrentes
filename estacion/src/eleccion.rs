@@ -26,20 +26,22 @@ pub enum EstadoLider {
 }
 
 /// Lo que la estación debe hacer tras procesar un mensaje del Ring. El actor la
-/// ejecuta: resuelve la dirección del `destino` y manda el `mensaje` por TCP.
+/// ejecuta: prueba entregar el `mensaje` a cada candidato de `destinos` **en
+/// orden** y se queda con el primero que acepte la conexión. Así el anillo
+/// saltea a los nodos caídos (típicamente, al líder que motivó la elección).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccionRing {
     /// El mensaje era obsoleto o ya dio la vuelta: no hay nada que hacer.
     Ignorar,
-    /// Reenviar `mensaje` al siguiente nodo del anillo.
+    /// Reenviar `mensaje` al primer nodo vivo de `destinos` (orden de anillo).
     Reenviar {
-        destino: EstacionId,
+        destinos: Vec<EstacionId>,
         mensaje: MensajeEntreEstacionesTCP,
     },
-    /// Asumo el liderazgo (el `Coordinator` me nombra a mí) y, si el anillo tiene
-    /// más de un nodo, reenvío el anuncio para que el resto se entere.
+    /// Asumo el liderazgo (el `Coordinator` me nombra a mí) y reenvío el anuncio
+    /// para que el resto se entere (`destinos` vacío si el anillo soy yo solo).
     AsumirYReenviar {
-        destino: Option<EstacionId>,
+        destinos: Vec<EstacionId>,
         mensaje: MensajeEntreEstacionesTCP,
     },
 }
@@ -80,9 +82,8 @@ impl Eleccion {
         self
     }
 
-    /// Término actual. Lo va a consumir el discovery (que deja de devolver un term
-    /// fijo) en el PR de detección de caída del líder.
-    #[allow(dead_code)]
+    /// Término actual (lo informa el discovery para que el usuario pueda descartar
+    /// respuestas viejas).
     pub fn term(&self) -> u64 {
         self.term
     }
@@ -92,20 +93,20 @@ impl Eleccion {
     }
 
     /// Arranca una elección: marca el estado en curso y manda un `Election` con el
-    /// propio id al siguiente del anillo. Si soy el único nodo, me autoproclamo. La
-    /// dispara la detección de caída del líder (timeout), que llega en el próximo PR.
-    #[allow(dead_code)]
+    /// propio id al siguiente del anillo. Si soy el único nodo, me autoproclamo.
+    /// La dispara la vigilancia del líder cuando el sondeo falla.
     pub fn iniciar(&mut self) -> AccionRing {
+        let destinos = self.sucesores();
+        if destinos.is_empty() {
+            return self.autoproclamarse();
+        }
         self.estado = EstadoLider::EnEleccion;
-        match self.siguiente() {
-            Some(destino) => AccionRing::Reenviar {
-                destino,
-                mensaje: MensajeEntreEstacionesTCP::Election {
-                    ids: vec![self.mi_id],
-                    iniciador: self.mi_id,
-                },
+        AccionRing::Reenviar {
+            destinos,
+            mensaje: MensajeEntreEstacionesTCP::Election {
+                ids: vec![self.mi_id],
+                iniciador: self.mi_id,
             },
-            None => self.autoproclamarse(),
         }
     }
 
@@ -126,12 +127,9 @@ impl Eleccion {
         }
         let mut ids = ids;
         ids.push(self.mi_id);
-        match self.siguiente() {
-            Some(destino) => AccionRing::Reenviar {
-                destino,
-                mensaje: MensajeEntreEstacionesTCP::Election { ids, iniciador },
-            },
-            None => AccionRing::Ignorar,
+        AccionRing::Reenviar {
+            destinos: self.sucesores(),
+            mensaje: MensajeEntreEstacionesTCP::Election { ids, iniciador },
         }
     }
 
@@ -149,14 +147,11 @@ impl Eleccion {
         self.term = term;
         self.estado = EstadoLider::Conocido(lider);
         let mensaje = MensajeEntreEstacionesTCP::Coordinator { lider, term };
-        let destino = self.siguiente();
+        let destinos = self.sucesores();
         if lider == self.mi_id {
-            AccionRing::AsumirYReenviar { destino, mensaje }
+            AccionRing::AsumirYReenviar { destinos, mensaje }
         } else {
-            match destino {
-                Some(destino) => AccionRing::Reenviar { destino, mensaje },
-                None => AccionRing::Ignorar,
-            }
+            AccionRing::Reenviar { destinos, mensaje }
         }
     }
 
@@ -169,24 +164,20 @@ impl Eleccion {
             lider: ganador,
             term: self.term,
         };
-        let destino = self.siguiente();
+        let destinos = self.sucesores();
         if ganador == self.mi_id {
-            AccionRing::AsumirYReenviar { destino, mensaje }
+            AccionRing::AsumirYReenviar { destinos, mensaje }
         } else {
-            match destino {
-                Some(destino) => AccionRing::Reenviar { destino, mensaje },
-                None => AccionRing::Ignorar,
-            }
+            AccionRing::Reenviar { destinos, mensaje }
         }
     }
 
     /// Anillo de un solo nodo: me convierto en líder sin circular nada.
-    #[allow(dead_code)]
     fn autoproclamarse(&mut self) -> AccionRing {
         self.term += 1;
         self.estado = EstadoLider::Conocido(self.mi_id);
         AccionRing::AsumirYReenviar {
-            destino: None,
+            destinos: Vec::new(),
             mensaje: MensajeEntreEstacionesTCP::Coordinator {
                 lider: self.mi_id,
                 term: self.term,
@@ -194,14 +185,18 @@ impl Eleccion {
         }
     }
 
-    /// Siguiente nodo del anillo (id inmediato mayor, con wraparound). `None` si
-    /// soy el único.
-    fn siguiente(&self) -> Option<EstacionId> {
-        if self.anillo.len() < 2 {
-            return None;
-        }
-        let pos = self.anillo.iter().position(|&id| id == self.mi_id)?;
-        Some(self.anillo[(pos + 1) % self.anillo.len()])
+    /// Sucesores en orden de anillo: el siguiente (id inmediato mayor, con
+    /// wraparound), después el que le sigue, etc. El que reenvía un mensaje del
+    /// Ring prueba en este orden hasta que un nodo acepte la conexión; un nodo
+    /// salteado por caído tampoco aparece en `ids`, así que no puede ganar la
+    /// elección (la gana la estación viva de id más alto, por construcción).
+    fn sucesores(&self) -> Vec<EstacionId> {
+        let Some(pos) = self.anillo.iter().position(|&id| id == self.mi_id) else {
+            return Vec::new();
+        };
+        (1..self.anillo.len())
+            .map(|i| self.anillo[(pos + i) % self.anillo.len()])
+            .collect()
     }
 }
 
@@ -219,13 +214,14 @@ mod tests {
     }
 
     #[test]
-    fn el_siguiente_del_mayor_es_el_menor() {
-        let e = Eleccion::new(est(5), anillo());
-        // No hay accessor público de `siguiente`, lo verificamos vía iniciar().
-        let mut e = e;
+    fn los_sucesores_del_mayor_arrancan_en_el_menor() {
+        // No hay accessor público de `sucesores`, lo verificamos vía iniciar().
+        let mut e = Eleccion::new(est(5), anillo());
         match e.iniciar() {
-            AccionRing::Reenviar { destino, .. } => assert_eq!(destino, est(1)),
-            otra => panic!("esperaba Reenviar al 1, fue {otra:?}"),
+            AccionRing::Reenviar { destinos, .. } => {
+                assert_eq!(destinos, vec![est(1), est(2), est(3)]);
+            }
+            otra => panic!("esperaba Reenviar con sucesores [1,2,3], fue {otra:?}"),
         }
     }
 
@@ -234,8 +230,12 @@ mod tests {
         let mut e = Eleccion::new(est(2), anillo());
         let accion = e.recibir_election(vec![est(1)], est(1));
         match accion {
-            AccionRing::Reenviar { destino, mensaje } => {
-                assert_eq!(destino, est(3), "el siguiente de la 2 es la 3");
+            AccionRing::Reenviar { destinos, mensaje } => {
+                assert_eq!(
+                    destinos,
+                    vec![est(3), est(5), est(1)],
+                    "primero la 3; si está caída, la 5; y la 1 cierra"
+                );
                 assert_eq!(
                     mensaje,
                     MensajeEntreEstacionesTCP::Election {
@@ -263,8 +263,12 @@ mod tests {
         let mut e = Eleccion::new(est(1), anillo());
         let accion = e.recibir_election(vec![est(1), est(2), est(3), est(5)], est(1));
         match accion {
-            AccionRing::Reenviar { destino, mensaje } => {
-                assert_eq!(destino, est(2), "el Coordinator arranca por el siguiente");
+            AccionRing::Reenviar { destinos, mensaje } => {
+                assert_eq!(
+                    destinos[0],
+                    est(2),
+                    "el Coordinator arranca por el siguiente"
+                );
                 assert_eq!(
                     mensaje,
                     MensajeEntreEstacionesTCP::Coordinator {
@@ -295,8 +299,8 @@ mod tests {
         let mut e = Eleccion::new(est(2), anillo());
         let accion = e.recibir_coordinator(est(5), 3);
         match accion {
-            AccionRing::Reenviar { destino, mensaje } => {
-                assert_eq!(destino, est(3));
+            AccionRing::Reenviar { destinos, mensaje } => {
+                assert_eq!(destinos[0], est(3));
                 assert_eq!(
                     mensaje,
                     MensajeEntreEstacionesTCP::Coordinator {
@@ -337,8 +341,8 @@ mod tests {
         let mut e = Eleccion::new(est(5), anillo());
         let accion = e.recibir_coordinator(est(5), 1);
         match accion {
-            AccionRing::AsumirYReenviar { destino, mensaje } => {
-                assert_eq!(destino, Some(est(1)));
+            AccionRing::AsumirYReenviar { destinos, mensaje } => {
+                assert_eq!(destinos, vec![est(1), est(2), est(3)]);
                 assert_eq!(
                     mensaje,
                     MensajeEntreEstacionesTCP::Coordinator {
@@ -356,8 +360,8 @@ mod tests {
     fn un_anillo_de_un_solo_nodo_se_autoelige() {
         let mut e = Eleccion::new(est(7), vec![est(7)]);
         match e.iniciar() {
-            AccionRing::AsumirYReenviar { destino, mensaje } => {
-                assert_eq!(destino, None, "no hay a quién reenviar");
+            AccionRing::AsumirYReenviar { destinos, mensaje } => {
+                assert!(destinos.is_empty(), "no hay a quién reenviar");
                 assert_eq!(
                     mensaje,
                     MensajeEntreEstacionesTCP::Coordinator {
@@ -378,8 +382,8 @@ mod tests {
         let mut e = Eleccion::new(est(5), anillo());
         let accion = e.recibir_election(vec![est(5), est(1), est(2), est(3)], est(5));
         match accion {
-            AccionRing::AsumirYReenviar { destino, mensaje } => {
-                assert_eq!(destino, Some(est(1)));
+            AccionRing::AsumirYReenviar { destinos, mensaje } => {
+                assert_eq!(destinos[0], est(1));
                 assert_eq!(
                     mensaje,
                     MensajeEntreEstacionesTCP::Coordinator {
@@ -389,6 +393,68 @@ mod tests {
                 );
             }
             otra => panic!("esperaba AsumirYReenviar, fue {otra:?}"),
+        }
+    }
+
+    /// Simula la red completa con una cola de mensajes: cada `AccionRing` se
+    /// entrega a su primer destino (acá están todos vivos). Dos estaciones
+    /// detectan la caída a la vez e inician elecciones simultáneas: el sistema
+    /// tiene que converger al mismo líder y al mismo term en todos los nodos,
+    /// sin mensajes girando para siempre.
+    #[test]
+    fn dos_elecciones_simultaneas_convergen_al_mismo_lider() {
+        use std::collections::{HashMap, VecDeque};
+
+        let mut nodos: HashMap<EstacionId, Eleccion> = anillo()
+            .into_iter()
+            .map(|id| (id, Eleccion::new(id, anillo())))
+            .collect();
+        let mut cola: VecDeque<(EstacionId, MensajeEntreEstacionesTCP)> = VecDeque::new();
+
+        // La 1 y la 3 inician sendas elecciones al mismo tiempo.
+        for iniciador in [est(1), est(3)] {
+            if let AccionRing::Reenviar { destinos, mensaje } =
+                nodos.get_mut(&iniciador).unwrap().iniciar()
+            {
+                cola.push_back((destinos[0], mensaje));
+            }
+        }
+
+        let mut pasos = 0;
+        while let Some((destino, mensaje)) = cola.pop_front() {
+            pasos += 1;
+            assert!(pasos < 100, "la elección no converge: mensajes girando");
+            let nodo = nodos.get_mut(&destino).unwrap();
+            let accion = match mensaje {
+                MensajeEntreEstacionesTCP::Election { ids, iniciador } => {
+                    nodo.recibir_election(ids, iniciador)
+                }
+                MensajeEntreEstacionesTCP::Coordinator { lider, term } => {
+                    nodo.recibir_coordinator(lider, term)
+                }
+                otro => panic!("mensaje inesperado en el anillo: {otro:?}"),
+            };
+            match accion {
+                AccionRing::Ignorar => {}
+                AccionRing::Reenviar { destinos, mensaje }
+                | AccionRing::AsumirYReenviar { destinos, mensaje } => {
+                    if let Some(&siguiente) = destinos.first() {
+                        cola.push_back((siguiente, mensaje));
+                    }
+                }
+            }
+        }
+
+        // Sin mensajes pendientes: todos reconocen a la 5, con el mismo term.
+        let term = nodos[&est(1)].term();
+        assert!(term >= 1);
+        for (id, nodo) in &nodos {
+            assert_eq!(
+                nodo.lider_conocido(),
+                EstadoLider::Conocido(est(5)),
+                "la {id:?} debería reconocer a la 5"
+            );
+            assert_eq!(nodo.term(), term, "term distinto en {id:?}");
         }
     }
 }
