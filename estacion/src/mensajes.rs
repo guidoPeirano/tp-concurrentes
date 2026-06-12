@@ -43,6 +43,20 @@ pub struct ConsultarRegistro;
 #[rtype(result = "usize")]
 pub struct ConsultarCache;
 
+/// Consulta de diagnóstico: a quién reconoce esta estación como líder, en qué
+/// term, y si el líder es ella misma.
+#[derive(Message)]
+#[rtype(result = "InfoLider")]
+pub struct ConsultarLider;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InfoLider {
+    /// `None` si hay una elección en curso o todavía no se conoce al líder.
+    pub lider_id: Option<comun::EstacionId>,
+    pub term: u64,
+    pub soy_lider: bool,
+}
+
 /// Fase Prepare del 2PC sobre el `Slot`: pide reservar la bici para una
 /// transacción. Responde con el voto.
 #[derive(Message)]

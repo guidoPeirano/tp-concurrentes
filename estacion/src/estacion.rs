@@ -13,7 +13,8 @@ use std::net::SocketAddr;
 
 use actix::prelude::*;
 use comun::comunicador::{
-    Comunicador, ConsultarTcp, EnviarTcp, EnviarUdp, PaqueteRecibido, Responder,
+    Comunicador, ConsultarTcp, EnviarTcp, EnviarTcpConfirmado, EnviarUdp, PaqueteRecibido,
+    Responder, Transporte,
 };
 use comun::mensajes::estacion_estacion::{MensajeEntreEstacionesTCP, MensajeEntreEstacionesUDP};
 use comun::mensajes::estacion_pasarela::{
@@ -30,11 +31,21 @@ use comun::{
 /// Cada cuánto cada estación le manda su estado al líder por UDP.
 const INTERVALO_GOSSIP: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Cada cuánto un follower sondea al líder para verificar que siga vivo.
+const INTERVALO_VIGILANCIA: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Sondeos fallidos consecutivos para dar al líder por caído e iniciar elección.
+const UMBRAL_FALLOS_LIDER: u8 = 2;
+
+/// Intervalos de vigilancia con una elección sin resolver antes de reiniciarla
+/// (cubre el caso de un mensaje del Ring perdido por una caída en cadena).
+const UMBRAL_ELECCION_TRABADA: u8 = 5;
+
 use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarCache, ConsultarEstado,
-    ConsultarRegistro, PrepareLiberacion, ProcesarDevolucion, RegistrarComunicador,
-    SolicitudUsuario, Voto,
+    ConsultarLider, ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion,
+    RegistrarComunicador, SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -83,6 +94,10 @@ pub struct Estacion {
     alquileres_propios: HashMap<RentalId, Alquiler>,
     /// Contador para generar ids únicos de transacción, alquiler y evento.
     contador: u64,
+    /// Sondeos al líder fallidos consecutivos (la vigilancia los cuenta).
+    fallos_lider: u8,
+    /// Intervalos de vigilancia transcurridos con la elección sin resolver.
+    intervalos_en_eleccion: u8,
 }
 
 impl Estacion {
@@ -117,6 +132,8 @@ impl Estacion {
             comunicador: None,
             alquileres_propios: HashMap::new(),
             contador: 0,
+            fallos_lider: 0,
+            intervalos_en_eleccion: 0,
         }
     }
 
@@ -203,11 +220,14 @@ impl Estacion {
     ) -> MensajeEstacionAUsuarioConsulta {
         match consulta {
             MensajeUsuarioAEstacionConsulta::PreguntarLider => {
-                // Líder fijo por config (sin elección todavía), así que term = 0.
-                MensajeEstacionAUsuarioConsulta::RespuestaLider {
-                    lider_id: self.lider_id,
-                    lider_addr: self.lider,
-                    term: 0,
+                match self.eleccion.lider_conocido() {
+                    EstadoLider::Conocido(_) => MensajeEstacionAUsuarioConsulta::RespuestaLider {
+                        lider_id: self.lider_id,
+                        lider_addr: self.lider,
+                        term: self.eleccion.term(),
+                    },
+                    EstadoLider::EnEleccion => MensajeEstacionAUsuarioConsulta::EnEleccion,
+                    EstadoLider::Desconocido => MensajeEstacionAUsuarioConsulta::LiderDesconocido,
                 }
             }
             MensajeUsuarioAEstacionConsulta::ConsultaDisponibilidad {
@@ -236,6 +256,7 @@ impl Estacion {
         &mut self,
         msg: MensajeEntreEstacionesTCP,
         responder: Option<Responder>,
+        ctx: &mut Context<Self>,
     ) {
         match msg {
             MensajeEntreEstacionesTCP::AlquilerAbierto {
@@ -296,60 +317,103 @@ impl Estacion {
                     alquiler.estado = EstadoAlquiler::Cerrado;
                 }
             }
+            // --- CU4: reconstrucción del registro tras una elección ---
+            MensajeEntreEstacionesTCP::SolicitarAlquileresAbiertos { .. } => {
+                // El nuevo líder está reconstruyendo su registro: le mando mis
+                // alquileres propios que siguen activos.
+                let alquileres: Vec<Alquiler> = self
+                    .alquileres_propios
+                    .values()
+                    .filter(|a| a.estado == EstadoAlquiler::Activo)
+                    .cloned()
+                    .collect();
+                let respuesta = MensajeEntreEstacionesTCP::RespuestaAlquileres { alquileres };
+                if let (Some(r), Ok(bytes)) = (responder, comun::serializacion::a_bytes(&respuesta))
+                {
+                    r.responder(bytes);
+                }
+            }
+
             // --- Ring de elección (CU4) ---
             MensajeEntreEstacionesTCP::Election { ids, iniciador } => {
                 let accion = self.eleccion.recibir_election(ids, iniciador);
-                self.aplicar_liderazgo();
-                self.ejecutar_accion_ring(accion);
+                self.procesar_accion_ring(accion, ctx);
             }
             MensajeEntreEstacionesTCP::Coordinator { lider, term } => {
                 let accion = self.eleccion.recibir_coordinator(lider, term);
-                self.aplicar_liderazgo();
-                self.ejecutar_accion_ring(accion);
+                self.procesar_accion_ring(accion, ctx);
             }
-            // Reconstrucción del registro y manejo de huérfanas: PRs siguientes.
+            // Manejo de bicis huérfanas: Etapa 6.
             _ => {}
         }
     }
 
-    /// Manda un mensaje entre estaciones al `destino` (resuelve su dirección en la
-    /// tabla de estaciones y lo despacha por el Comunicador).
-    fn enviar_a_estacion(&self, destino: EstacionId, mensaje: &MensajeEntreEstacionesTCP) {
-        if let (Some(addr), Some(comunicador), Ok(bytes)) = (
-            self.estaciones.get(&destino).copied(),
-            &self.comunicador,
-            comun::serializacion::a_bytes(mensaje),
-        ) {
-            comunicador.do_send(EnviarTcp {
-                destino: addr,
-                datos: bytes,
-            });
-        }
+    /// Aplica el resultado de un paso del Ring: primero el cambio de rol/líder que
+    /// dictaminó la elección, después el reenvío del mensaje por el anillo.
+    fn procesar_accion_ring(&mut self, accion: AccionRing, ctx: &mut Context<Self>) {
+        self.aplicar_liderazgo(ctx);
+        self.ejecutar_accion_ring(accion, ctx);
     }
 
-    /// Ejecuta la acción que dictó el algoritmo de elección: reenviar el mensaje al
-    /// siguiente del anillo y/o no hacer nada. El cambio de rol lo aplica antes
-    /// `aplicar_liderazgo`.
-    fn ejecutar_accion_ring(&mut self, accion: AccionRing) {
-        match accion {
-            AccionRing::Ignorar => {}
-            AccionRing::Reenviar { destino, mensaje } => self.enviar_a_estacion(destino, &mensaje),
-            AccionRing::AsumirYReenviar { destino, mensaje } => {
-                if let Some(destino) = destino {
-                    self.enviar_a_estacion(destino, &mensaje);
+    /// Reenvía un mensaje del Ring probando los `destinos` en orden de anillo
+    /// hasta que uno acepte la conexión (así se saltean los nodos caídos). Si
+    /// ninguno es alcanzable, el anillo se reduce a esta estación: el mensaje
+    /// "da la vuelta" entregándose a sí misma, lo que cierra la elección si era
+    /// propia (y se descarta si no lo era).
+    fn ejecutar_accion_ring(&mut self, accion: AccionRing, ctx: &mut Context<Self>) {
+        let (destinos, mensaje) = match accion {
+            AccionRing::Ignorar => return,
+            AccionRing::Reenviar { destinos, mensaje }
+            | AccionRing::AsumirYReenviar { destinos, mensaje } => (destinos, mensaje),
+        };
+        if destinos.is_empty() {
+            return;
+        }
+        let (Some(comunicador), Ok(bytes)) = (
+            self.comunicador.clone(),
+            comun::serializacion::a_bytes(&mensaje),
+        ) else {
+            return;
+        };
+        let direcciones: Vec<(EstacionId, SocketAddr)> = destinos
+            .iter()
+            .filter_map(|id| self.estaciones.get(id).map(|addr| (*id, *addr)))
+            .collect();
+        let yo = ctx.address();
+        let mi_id = self.id;
+        let fut = async move {
+            for (id, addr) in direcciones {
+                let entregado = comunicador
+                    .send(EnviarTcpConfirmado {
+                        destino: addr,
+                        datos: bytes.clone(),
+                    })
+                    .await
+                    .unwrap_or(false);
+                if entregado {
+                    return;
                 }
+                println!("[{mi_id}] {id} no responde, salteo al siguiente del anillo");
             }
-        }
+            // Nadie alcanzable: me lo entrego a mí misma (vuelta completa).
+            yo.do_send(PaqueteRecibido {
+                transporte: Transporte::Tcp,
+                datos: bytes,
+                responder: None,
+            });
+        };
+        ctx.spawn(fut.into_actor(self).map(|_, _, _| ()));
     }
 
-    /// Sincroniza el rol y el puntero al líder con lo que dictaminó el Ring. Si el
-    /// líder cambió, ajusta `lider`/`lider_id`; si paso a ser líder arranco con el
-    /// registro vacío (la reconstrucción real es del próximo PR), y si dejo de
-    /// serlo vuelvo a follower.
-    fn aplicar_liderazgo(&mut self) {
+    /// Sincroniza el rol y el puntero al líder con lo que dictaminó el Ring. Si
+    /// esta estación pasa a ser líder, reconstruye el registro pidiéndole a cada
+    /// estación sus alquileres abiertos; si deja de serlo, vuelve a follower.
+    fn aplicar_liderazgo(&mut self, ctx: &mut Context<Self>) {
         let EstadoLider::Conocido(lider_id) = self.eleccion.lider_conocido() else {
             return;
         };
+        self.fallos_lider = 0;
+        self.intervalos_en_eleccion = 0;
         self.lider_id = lider_id;
         if let Some(addr) = self.estaciones.get(&lider_id).copied() {
             self.lider = addr;
@@ -357,13 +421,141 @@ impl Estacion {
         let soy_lider = lider_id == self.id;
         let era_lider = matches!(self.rol, RolEstacion::Lider { .. });
         if soy_lider && !era_lider {
+            println!(
+                "[{}] asumo como líder (term {})",
+                self.id,
+                self.eleccion.term()
+            );
             self.rol = RolEstacion::Lider {
                 registro: Registro::new(),
                 cache: HashMap::new(),
             };
+            self.reconstruir_registro(ctx);
         } else if !soy_lider && era_lider {
+            println!("[{}] dejo de ser líder: ahora lidera {}", self.id, lider_id);
             self.rol = RolEstacion::Follower;
         }
+    }
+
+    /// Reconstruye el registro del líder recién electo: arranca con los alquileres
+    /// propios y le pide los suyos a cada una de las otras estaciones
+    /// (`SolicitarAlquileresAbiertos`). Si alguna no responde, se continúa con
+    /// datos parciales (como pide el enunciado); sus alquileres se recuperan por
+    /// la vía de las bicis huérfanas (Etapa 6) o cuando se reincorpore.
+    fn reconstruir_registro(&mut self, ctx: &mut Context<Self>) {
+        let propios: Vec<Alquiler> = self
+            .alquileres_propios
+            .values()
+            .filter(|a| a.estado == EstadoAlquiler::Activo)
+            .cloned()
+            .collect();
+        if let RolEstacion::Lider { registro, .. } = &mut self.rol {
+            for alquiler in propios {
+                registro.agregar(alquiler);
+            }
+        }
+        let term = self.eleccion.term();
+        let comunicador = self.comunicador.clone();
+        let destinos: Vec<SocketAddr> = self
+            .estaciones
+            .iter()
+            .filter(|(id, _)| **id != self.id)
+            .map(|(_, addr)| *addr)
+            .collect();
+        let fut = async move {
+            let mut recuperados = Vec::new();
+            let (Some(comunicador), Ok(bytes)) = (
+                comunicador,
+                comun::serializacion::a_bytes(
+                    &MensajeEntreEstacionesTCP::SolicitarAlquileresAbiertos { term },
+                ),
+            ) else {
+                return recuperados;
+            };
+            for destino in destinos {
+                let respuesta = comunicador
+                    .send(ConsultarTcp {
+                        destino,
+                        datos: bytes.clone(),
+                    })
+                    .await;
+                if let Ok(Some(datos)) = respuesta {
+                    if let Ok(MensajeEntreEstacionesTCP::RespuestaAlquileres { alquileres }) =
+                        comun::serializacion::desde_bytes(&datos)
+                    {
+                        recuperados.extend(alquileres);
+                    }
+                }
+            }
+            recuperados
+        }
+        .into_actor(self)
+        .map(|alquileres, actor, _ctx| {
+            if let RolEstacion::Lider { registro, .. } = &mut actor.rol {
+                for alquiler in alquileres {
+                    registro.agregar(alquiler);
+                }
+                println!(
+                    "[{}] registro reconstruido: {} alquileres activos",
+                    actor.id,
+                    registro.activos()
+                );
+            }
+        });
+        ctx.spawn(fut);
+    }
+
+    /// Vigilancia del líder (corre cada `INTERVALO_VIGILANCIA`): un follower
+    /// sondea al líder con un request-response; tras `UMBRAL_FALLOS_LIDER` fallos
+    /// consecutivos lo da por caído e inicia una elección.
+    ///
+    /// TODO(etapa 6): el sondeo detecta un proceso caído (conexión rechazada),
+    /// pero no uno colgado con el socket abierto; eso lo cubren los timeouts de
+    /// lectura que llegan con la tolerancia a fallas.
+    fn vigilar_lider(&mut self, ctx: &mut Context<Self>) {
+        match self.eleccion.lider_conocido() {
+            EstadoLider::Conocido(lider_id) if lider_id == self.id => return, // el líder soy yo
+            EstadoLider::Conocido(_) => {}
+            EstadoLider::EnEleccion => {
+                // Una elección puede quedar trabada si el que tenía que reenviar
+                // se cayó con el mensaje encima: tras unos intervalos sin
+                // resolverse, la reiniciamos.
+                self.intervalos_en_eleccion += 1;
+                if self.intervalos_en_eleccion >= UMBRAL_ELECCION_TRABADA {
+                    self.intervalos_en_eleccion = 0;
+                    let accion = self.eleccion.iniciar();
+                    self.procesar_accion_ring(accion, ctx);
+                }
+                return;
+            }
+            EstadoLider::Desconocido => {
+                // No hay líder que vigilar: directamente elegimos uno.
+                let accion = self.eleccion.iniciar();
+                self.procesar_accion_ring(accion, ctx);
+                return;
+            }
+        }
+        let comunicador = self.comunicador.clone();
+        let lider = self.lider;
+        let fut = async move { sondear_lider(&comunicador, lider).await }
+            .into_actor(self)
+            .map(|vivo, actor, ctx| {
+                if vivo {
+                    actor.fallos_lider = 0;
+                    return;
+                }
+                actor.fallos_lider += 1;
+                if actor.fallos_lider >= UMBRAL_FALLOS_LIDER {
+                    actor.fallos_lider = 0;
+                    println!(
+                        "[{}] el líder {} no responde: inicio elección",
+                        actor.id, actor.lider_id
+                    );
+                    let accion = actor.eleccion.iniciar();
+                    actor.procesar_accion_ring(accion, ctx);
+                }
+            });
+        ctx.spawn(fut);
     }
 
     /// Datos que necesita `procesar_operacion`, capturados antes del trabajo async.
@@ -416,6 +608,8 @@ impl Actor for Estacion {
         // Gossip: cada estación (incluido el líder, a sí mismo) le manda su estado
         // al líder por UDP. Así el líder arma su cache para responder consultas.
         ctx.run_interval(INTERVALO_GOSSIP, |act, ctx| act.enviar_estado(ctx));
+        // Vigilancia del líder: si deja de responder, se inicia una elección.
+        ctx.run_interval(INTERVALO_VIGILANCIA, |act, ctx| act.vigilar_lider(ctx));
     }
 }
 
@@ -446,6 +640,22 @@ impl Handler<ConsultarCache> for Estacion {
             RolEstacion::Lider { cache, .. } => cache.len(),
             RolEstacion::Follower => 0,
         }
+    }
+}
+
+impl Handler<ConsultarLider> for Estacion {
+    type Result = MessageResult<ConsultarLider>;
+
+    fn handle(&mut self, _msg: ConsultarLider, _ctx: &mut Self::Context) -> Self::Result {
+        let lider_id = match self.eleccion.lider_conocido() {
+            EstadoLider::Conocido(id) => Some(id),
+            _ => None,
+        };
+        MessageResult(InfoLider {
+            lider_id,
+            term: self.eleccion.term(),
+            soy_lider: matches!(self.rol, RolEstacion::Lider { .. }),
+        })
     }
 }
 
@@ -554,6 +764,29 @@ impl Handler<ProcesarDevolucion> for Estacion {
             }),
         )
     }
+}
+
+/// Sondea al líder con un `PreguntarLider` (request-response): `true` si contestó
+/// algo, `false` si no se pudo conectar o no respondió. Reusa el mensaje de
+/// discovery: no hace falta un "ping" propio en el protocolo.
+async fn sondear_lider(comunicador: &Option<Addr<Comunicador>>, lider: SocketAddr) -> bool {
+    let Some(comunicador) = comunicador else {
+        // Sin red cableada (tests unitarios) no se vigila a nadie.
+        return true;
+    };
+    let consulta = MensajeUsuario::Consulta(MensajeUsuarioAEstacionConsulta::PreguntarLider);
+    let Ok(bytes) = comun::serializacion::a_bytes(&consulta) else {
+        return true;
+    };
+    matches!(
+        comunicador
+            .send(ConsultarTcp {
+                destino: lider,
+                datos: bytes,
+            })
+            .await,
+        Ok(Some(_))
+    )
 }
 
 /// Le pide al Comunicador que haga el request-response con la pasarela y devuelve
@@ -796,12 +1029,12 @@ impl Handler<SolicitudUsuario> for Estacion {
 impl Handler<PaqueteRecibido> for Estacion {
     type Result = ResponseActFuture<Self, ()>;
 
-    fn handle(&mut self, msg: PaqueteRecibido, _ctx: &mut Self::Context) -> Self::Result {
-        // ¿Es un mensaje entre estaciones (reporte/devolución al líder, etc.)?
+    fn handle(&mut self, msg: PaqueteRecibido, ctx: &mut Self::Context) -> Self::Result {
+        // ¿Es un mensaje entre estaciones (reporte/devolución al líder, Ring, etc.)?
         if let Ok(entre_estaciones) =
             comun::serializacion::desde_bytes::<MensajeEntreEstacionesTCP>(&msg.datos)
         {
-            self.manejar_entre_estaciones(entre_estaciones, msg.responder);
+            self.manejar_entre_estaciones(entre_estaciones, msg.responder, ctx);
             return Box::pin(async {}.into_actor(self).map(|_, _, _| ()));
         }
 
@@ -1068,9 +1301,18 @@ mod tests {
                 MensajeEstacionAUsuario::DevolucionAceptada { .. }
             ));
 
-            // El background (ProcesarDevolucion) corre antes que esta consulta y
-            // cierra el alquiler en el registro.
-            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
+            // El cierre (ProcesarDevolucion) corre en background: el cobro pasa
+            // por el Comunicador (asincrónico), así que esperamos a que el
+            // registro refleje el cierre en vez de asumir el orden.
+            let mut activos = usize::MAX;
+            for _ in 0..50 {
+                activos = estacion.send(ConsultarRegistro).await.unwrap();
+                if activos == 0 {
+                    break;
+                }
+                actix::clock::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(activos, 0, "la devolución debería cerrar el alquiler");
         });
     }
 
@@ -1294,6 +1536,89 @@ mod tests {
                     assert_eq!(ids, vec![2], "solo la 2 está cerca y con bicis");
                 }
                 otra => panic!("esperaba RespuestaDisponibilidad, fue {otra:?}"),
+            }
+        });
+    }
+
+    /// Escenario completo de la Etapa 5: el líder (9) está caído desde el
+    /// arranque. Las estaciones vivas (1, 2, 3) lo detectan por el sondeo,
+    /// corren el Ring salteando al muerto (el sucesor de la 3 es la 9), gana la
+    /// 3 (mayor id vivo), y el nuevo líder reconstruye su registro con el
+    /// alquiler que la 1 tenía abierto.
+    #[test]
+    fn caida_del_lider_dispara_eleccion_y_reconstruye_el_registro() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            // Puertos fijos del rango de tests: las estaciones se tienen que
+            // conocer entre sí ANTES de arrancar (igual que con la config real).
+            let puerto = |id: u32| 19020 + id as u16;
+            let direccion = |id: u32| SocketAddr::from(([127, 0, 0, 1], puerto(id)));
+            let estaciones: HashMap<EstacionId, SocketAddr> = [1, 2, 3, 9]
+                .into_iter()
+                .map(|id| (EstacionId(id), direccion(id)))
+                .collect();
+
+            let mut actores = Vec::new();
+            for id in [1u32, 2, 3] {
+                let slots = vec![Slot::con_bici(0, BiciId(40 + id)).start()];
+                let estacion = Estacion::new(
+                    EstacionId(id),
+                    (0.0, 0.0),
+                    slots,
+                    pasarela,
+                    (EstacionId(9), direccion(9)), // líder por config: muerto
+                    false,
+                    estaciones.clone(),
+                )
+                .start();
+                let comunicador =
+                    Comunicador::new(direccion(id), direccion(id), estacion.clone().recipient())
+                        .start();
+                estacion
+                    .send(RegistrarComunicador(comunicador))
+                    .await
+                    .unwrap();
+                actores.push(estacion);
+            }
+
+            // La 1 alquila: le queda un alquiler propio activo (el reporte al
+            // líder muerto se pierde; lo recupera la reconstrucción).
+            let resp = actores[0].send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::AlquilerConfirmado { .. }
+            ));
+
+            // Vigilancia (2s) × umbral (2 fallos) ≈ 4s hasta la elección; después
+            // circula el Ring y se reconstruye el registro. Esperamos hasta 15s.
+            let mut convergio = false;
+            for _ in 0..30 {
+                actix::clock::sleep(std::time::Duration::from_millis(500)).await;
+                let info = actores[2].send(ConsultarLider).await.unwrap();
+                if info.soy_lider
+                    && info.lider_id == Some(EstacionId(3))
+                    && actores[2].send(ConsultarRegistro).await.unwrap() == 1
+                {
+                    convergio = true;
+                    break;
+                }
+            }
+            assert!(
+                convergio,
+                "la 3 debería asumir como líder con el registro reconstruido (1 alquiler)"
+            );
+
+            // Las demás reconocen a la 3 como líder, con term post-elección.
+            for (i, actor) in actores.iter().enumerate().take(2) {
+                let info = actor.send(ConsultarLider).await.unwrap();
+                assert_eq!(
+                    info.lider_id,
+                    Some(EstacionId(3)),
+                    "la estación {} debería reconocer a la 3",
+                    i + 1
+                );
+                assert!(info.term >= 1, "el term debe haber avanzado");
+                assert!(!info.soy_lider);
             }
         });
     }
