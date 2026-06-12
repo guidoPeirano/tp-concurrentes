@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verificacion:
+    name: fmt + clippy + build + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Componentes de Rust (rustfmt, clippy)
+        run: rustup component add rustfmt clippy
+
+      - name: Versiones
+        run: cargo --version && rustc --version
+
+      - name: Formato (cargo fmt --check)
+        run: cargo fmt --all -- --check
+
+      - name: Linter (clippy sin warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Compilación
+        run: cargo build --verbose
+
+      - name: Tests
+        run: cargo test --verbose
