@@ -65,6 +65,16 @@ pub struct EnviarUdp {
     pub datos: Vec<u8>,
 }
 
+/// Pide un request-response por TCP: conecta a `destino`, manda el payload
+/// (enmarcado) y devuelve la respuesta, o `None` si no se pudo. Lo usa la estación
+/// para hablarle a la pasarela en el 2PC, sin tocar sockets ella misma.
+#[derive(Message)]
+#[rtype(result = "Option<Vec<u8>>")]
+pub struct ConsultarTcp {
+    pub destino: SocketAddr,
+    pub datos: Vec<u8>,
+}
+
 pub struct Comunicador {
     addr_tcp: SocketAddr,
     addr_udp: SocketAddr,
@@ -114,6 +124,15 @@ impl Handler<EnviarUdp> for Comunicador {
         if let Some(socket) = &self.socket_udp {
             let _ = socket.send_to(&msg.datos, msg.destino);
         }
+    }
+}
+
+impl Handler<ConsultarTcp> for Comunicador {
+    type Result = MessageResult<ConsultarTcp>;
+
+    fn handle(&mut self, msg: ConsultarTcp, _ctx: &mut Self::Context) -> Self::Result {
+        // Round-trip bloqueante; el destino es otro proceso (no hay deadlock).
+        MessageResult(solicitar_tcp(msg.destino, &msg.datos).ok())
     }
 }
 
@@ -200,6 +219,32 @@ fn enviar_tcp(destino: SocketAddr, datos: &[u8]) {
         thread::sleep(Duration::from_millis(50));
     }
     eprintln!("[comunicador] no pude conectar a {destino} para enviar por TCP");
+}
+
+/// Cliente TCP request-response: conecta, manda un payload enmarcado y devuelve
+/// la respuesta (también enmarcada) por la misma conexión. Es **bloqueante**.
+/// Interno del Comunicador: lo usa el handler de `ConsultarTcp`.
+fn solicitar_tcp(destino: SocketAddr, datos: &[u8]) -> std::io::Result<Vec<u8>> {
+    let frame = enmarcar_payload(datos)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut stream = TcpStream::connect(destino)?;
+    stream.write_all(&frame)?;
+
+    let mut desenmarcador = Desenmarcador::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "la conexión se cerró sin respuesta",
+            ));
+        }
+        desenmarcador.alimentar(&buf[..n]);
+        if let Some(payload) = desenmarcador.siguiente_payload() {
+            return Ok(payload);
+        }
+    }
 }
 
 #[cfg(test)]
