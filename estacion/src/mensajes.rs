@@ -14,7 +14,16 @@ use comun::{BiciId, Timestamp, TransaccionId};
 pub struct ProcesarDevolucion {
     pub bici_id: BiciId,
     pub t1: Timestamp,
+    /// `true` si este es el reintento posterior a una recuperación de huérfana:
+    /// si vuelve a fallar, la bici se confirma huérfana (no se busca de nuevo).
+    pub ya_reprocesada: bool,
 }
+
+/// Consulta de diagnóstico: cuántas bicis quedaron confirmadas como huérfanas
+/// (llegaron a un slot sin alquiler asociado en ninguna estación).
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarHuerfanas;
 
 /// Un pedido de usuario (alquiler/devolución) que la estación procesa localmente:
 /// rutea al slot que corresponde y coordina el 2PC. Envuelve el mensaje de red
