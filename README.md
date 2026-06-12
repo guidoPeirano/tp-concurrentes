@@ -671,8 +671,8 @@ Cuando el usuario reintente el alquiler, arranca un nuevo 2PC con un nuevo `tx_i
 **Caso C — Coordinador se cae durante Commit (después de que algún participante ya commiteó).**
 Acá puede haber inconsistencia temporal: el Slot commiteó (liberó la bici) pero la Pasarela no llegó a commitear. Mitigación:
 
-- Si la Pasarela timeoutea sobre el `Commit` esperado, no aborta: como ya votó `Yes`, sabe que el coordinador decidió commit (o estaba a punto de hacerlo). Espera reintentos. Cuando el coordinador vuelve, persiste sus alquileres pendientes en disco y completa el Commit que le faltaba.
-- Si el coordinador no vuelve nunca (caída permanente), la pre-autorización queda en estado `Preparada` indefinidamente. El sistema la detecta como "transacción huérfana" tras un tiempo prudencial (configurable, default: 1 hora) y la marca como `Anulada`. El usuario que se llevó la bici real (porque el Slot sí commiteó) no es cobrado por este alquiler — el alquiler nunca quedó registrado en el sistema.
+- El coordinador deja **constancia persistida de la decisión COMMIT antes de enviarla** (write-ahead): si el `CommitPreauth` se pierde o el proceso se cae, un reintento periódico (default: 5 segundos) lo completa al volver. El re-Commit es seguro porque la pasarela responde idempotentemente.
+- La pasarela, por su parte, aplica el mismo timeout de transacción del Caso B: si la decisión no le llega en el plazo, anula la pre-autorización y libera los fondos. Si el reintento del coordinador llega después de esa anulación, recibe `PreauthAnulada`: ese alquiler ya no tiene pre-autorización cobrable, y la bici se resuelve por el protocolo de huérfanas (sección 8.2.1) cuando se devuelva. El usuario que se llevó la bici no es cobrado por este alquiler.
 
 **Caso D — Participante recibe un mensaje duplicado.**
 Si por reintentos un participante recibe dos veces el mismo `PrepareLiberacion` con el mismo `tx_id`, responde idempotentemente (misma respuesta que la primera vez, sin re-procesar). Lo mismo aplica para `Commit` y `Abort`. Cada participante mantiene un set de `tx_id` ya procesados.
@@ -708,7 +708,7 @@ struct PagoPendiente {
 |---|---|---|
 | Prepare → Voto | 3 segundos | Si |
 | Voto Yes → Commit/Abort | 10 segundos | Si |
-| Detección de transacción huérfana | 1 hora | Si |
+| Reintento de un Commit decidido sin confirmar | 5 segundos | Si |
 | Intento de conexión a pasarela (antes de resolver el alquiler solo con el Slot) | 5 segundos | Si |
 
 **Persistencia del estado del 2PC.** El coordinador persiste en disco la transacción cuando todos votaron `Yes` y antes de enviar `Commit`. Esto permite recuperarse de un crash del coordinador entre Prepare y Commit: al reiniciar, lee las transacciones pendientes y completa el Commit que tenía pendiente.
