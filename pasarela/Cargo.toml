@@ -6,3 +6,4 @@ version.workspace = true
 [dependencies]
 comun = { path = "../comun" }
 actix = { workspace = true }
+serde = { workspace = true }
