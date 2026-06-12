@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use actix::prelude::*;
 use comun::comunicador::{
@@ -27,6 +28,7 @@ use comun::mensajes::usuario_estacion::{
 use comun::{
     Alquiler, EstacionId, EstadoAlquiler, EventId, InfoEstacion, RentalId, Timestamp, TransaccionId,
 };
+use serde::{Deserialize, Serialize};
 
 /// Cada cuánto cada estación le manda su estado al líder por UDP.
 const INTERVALO_GOSSIP: std::time::Duration = std::time::Duration::from_secs(3);
@@ -53,11 +55,16 @@ const REINTENTOS_NOTIFICACION: u32 = 4;
 /// Espera base entre reintentos de `NotificarDevolucion` (crece linealmente).
 const ESPERA_REINTENTO: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Cada cuánto se reintentan los commits decididos que la pasarela todavía no
+/// confirmó (Caso C: el Commit se perdió o la pasarela estaba caída).
+const INTERVALO_REINTENTO_COMMITS: std::time::Duration = std::time::Duration::from_secs(5);
+
 use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
-    AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarCache, ConsultarEstado,
-    ConsultarLider, ConsultarPendientes, ConsultarRegistro, InfoLider, PrepareLiberacion,
-    ProcesarDevolucion, RegistrarComunicador, SolicitudUsuario, Voto,
+    AbortLiberacion, AceptarBici, CommitConfirmado, CommitLiberacion, ConsultarCache,
+    ConsultarCommitsPendientes, ConsultarEstado, ConsultarLider, ConsultarPendientes,
+    ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion, RegistrarCommitPendiente,
+    RegistrarComunicador, SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -129,6 +136,23 @@ pub struct Estacion {
     /// Cola de diferidos: eventos al líder que no se pudieron entregar. Se
     /// reintentan cuando el líder vuelve a responder (o tras una elección).
     eventos_pendientes: Vec<MensajeEntreEstacionesTCP>,
+    /// Commits del 2PC decididos pero todavía sin confirmación de la pasarela
+    /// (Caso C). Se reintentan periódicamente y sobreviven reinicios.
+    commits_pendientes: HashMap<TransaccionId, String>,
+    /// Archivo de persistencia (si está, el estado sobrevive un reinicio).
+    archivo: Option<PathBuf>,
+    /// Cada cuánto reintentar los commits pendientes (acortable en tests).
+    intervalo_reintento_commits: std::time::Duration,
+}
+
+/// Lo que la estación guarda en disco: sus alquileres, los commits decididos
+/// sin confirmar y la cola de eventos diferidos al líder. El rol y la elección
+/// NO se persisten: al reiniciar se rearma por config + discovery/elección.
+#[derive(Serialize, Deserialize)]
+struct EstadoEnDisco {
+    alquileres_propios: HashMap<RentalId, Alquiler>,
+    commits_pendientes: Vec<(TransaccionId, String)>,
+    eventos_pendientes: Vec<MensajeEntreEstacionesTCP>,
 }
 
 impl Estacion {
@@ -163,6 +187,63 @@ impl Estacion {
             fallos_lider: 0,
             intervalos_en_eleccion: 0,
             eventos_pendientes: Vec::new(),
+            commits_pendientes: HashMap::new(),
+            archivo: None,
+            intervalo_reintento_commits: INTERVALO_REINTENTO_COMMITS,
+        }
+    }
+
+    /// Activa la persistencia en `ruta`: si ya hay un estado guardado lo carga
+    /// (recuperación tras reinicio) y, si esta estación arranca como líder por
+    /// config, repuebla su registro con sus propios alquileres activos.
+    pub fn con_persistencia(mut self, ruta: PathBuf) -> Self {
+        if let Some(estado) = comun::persistencia::cargar::<EstadoEnDisco>(&ruta) {
+            println!(
+                "[{}] estado recuperado de {:?}: {} alquileres, {} commits pendientes, {} eventos diferidos",
+                self.id,
+                ruta,
+                estado.alquileres_propios.len(),
+                estado.commits_pendientes.len(),
+                estado.eventos_pendientes.len()
+            );
+            self.alquileres_propios = estado.alquileres_propios;
+            self.commits_pendientes = estado.commits_pendientes.into_iter().collect();
+            self.eventos_pendientes = estado.eventos_pendientes;
+            if let RolEstacion::Lider { registro, .. } = &mut self.rol {
+                for alquiler in self
+                    .alquileres_propios
+                    .values()
+                    .filter(|a| a.estado == EstadoAlquiler::Activo)
+                {
+                    registro.agregar(alquiler.clone());
+                }
+            }
+        }
+        self.archivo = Some(ruta);
+        self
+    }
+
+    /// Acorta el intervalo de reintento de commits (para tests).
+    #[cfg(test)]
+    pub fn con_intervalo_de_reintento(mut self, intervalo: std::time::Duration) -> Self {
+        self.intervalo_reintento_commits = intervalo;
+        self
+    }
+
+    /// Vuelca el estado a disco (si la persistencia está activa).
+    fn persistir(&self) {
+        let Some(ruta) = &self.archivo else { return };
+        let estado = EstadoEnDisco {
+            alquileres_propios: self.alquileres_propios.clone(),
+            commits_pendientes: self
+                .commits_pendientes
+                .iter()
+                .map(|(t, p)| (t.clone(), p.clone()))
+                .collect(),
+            eventos_pendientes: self.eventos_pendientes.clone(),
+        };
+        if let Err(e) = comun::persistencia::guardar(ruta, &estado) {
+            eprintln!("[{}] no pude persistir el estado en {ruta:?}: {e}", self.id);
         }
     }
 
@@ -246,6 +327,7 @@ impl Estacion {
             comun::serializacion::a_bytes(&evento),
         ) else {
             self.eventos_pendientes.push(evento);
+            self.persistir();
             return;
         };
         let destino = self.lider;
@@ -266,6 +348,7 @@ impl Estacion {
                     actor.id
                 );
                 actor.eventos_pendientes.push(evento);
+                actor.persistir();
             }
         });
         ctx.spawn(fut);
@@ -278,6 +361,7 @@ impl Estacion {
             return;
         }
         let pendientes = std::mem::take(&mut self.eventos_pendientes);
+        self.persistir();
         println!(
             "[{}] reintento {} eventos diferidos al líder",
             self.id,
@@ -412,6 +496,7 @@ impl Estacion {
                 // Soy la estación de origen: marco mi alquiler como cerrado.
                 if let Some(alquiler) = self.alquileres_propios.get_mut(&rental_id) {
                     alquiler.estado = EstadoAlquiler::Cerrado;
+                    self.persistir();
                 }
             }
             // --- CU4: reconstrucción del registro tras una elección ---
@@ -656,7 +741,7 @@ impl Estacion {
     }
 
     /// Datos que necesita `procesar_operacion`, capturados antes del trabajo async.
-    fn contexto(&mut self) -> ContextoOperacion {
+    fn contexto(&mut self, ctx: &mut Context<Self>) -> ContextoOperacion {
         let n = self.proximo();
         ContextoOperacion {
             tx_id: TransaccionId(format!("T-{}-{}", self.id.0, n)),
@@ -665,7 +750,63 @@ impl Estacion {
             estacion_origen: self.id,
             pasarela: self.pasarela,
             comunicador: self.comunicador.clone(),
+            yo: ctx.address(),
         }
+    }
+
+    /// Reintenta los commits decididos que la pasarela todavía no confirmó
+    /// (Caso C). El re-Commit es seguro: la pasarela es idempotente. Si la
+    /// pasarela responde `PreauthAnulada` (la anuló por su propio timeout), no
+    /// queda nada que completar y la constancia se descarta.
+    fn reintentar_commits(&mut self, ctx: &mut Context<Self>) {
+        if self.commits_pendientes.is_empty() {
+            return;
+        }
+        let pendientes: Vec<(TransaccionId, String)> = self
+            .commits_pendientes
+            .iter()
+            .map(|(t, p)| (t.clone(), p.clone()))
+            .collect();
+        println!(
+            "[{}] reintento {} commits pendientes contra la pasarela",
+            self.id,
+            pendientes.len()
+        );
+        let comunicador = self.comunicador.clone();
+        let pasarela = self.pasarela;
+        let fut = async move {
+            let mut resueltos = Vec::new();
+            for (tx_id, preauth_id) in pendientes {
+                let commit = MensajeEstacionAPasarela::CommitPreauth {
+                    tx_id: tx_id.clone(),
+                    preauth_id,
+                };
+                match comun::tiempo::con_timeout(
+                    TIMEOUT_PREPARE,
+                    consultar_pasarela(&comunicador, pasarela, &commit),
+                )
+                .await
+                .flatten()
+                {
+                    Some(MensajePasarelaAEstacion::PreauthConfirmada { .. })
+                    | Some(MensajePasarelaAEstacion::PreauthAnulada { .. }) => {
+                        resueltos.push(tx_id);
+                    }
+                    _ => {} // sigue pendiente, se reintenta en el próximo intervalo
+                }
+            }
+            resueltos
+        }
+        .into_actor(self)
+        .map(|resueltos, actor, _ctx| {
+            if !resueltos.is_empty() {
+                for tx_id in resueltos {
+                    actor.commits_pendientes.remove(&tx_id);
+                }
+                actor.persistir();
+            }
+        });
+        ctx.spawn(fut);
     }
 }
 
@@ -677,6 +818,9 @@ struct ContextoOperacion {
     estacion_origen: EstacionId,
     pasarela: SocketAddr,
     comunicador: Option<Addr<Comunicador>>,
+    /// `Addr` de la propia estación: el 2PC le avisa el commit decidido (para
+    /// que lo persista ANTES de mandarlo) y la confirmación de la pasarela.
+    yo: Addr<Estacion>,
 }
 
 /// Distancia aproximada en km entre dos puntos `(lat, lon)` en grados, con la
@@ -707,6 +851,11 @@ impl Actor for Estacion {
         ctx.run_interval(INTERVALO_GOSSIP, |act, ctx| act.enviar_estado(ctx));
         // Vigilancia del líder: si deja de responder, se inicia una elección.
         ctx.run_interval(INTERVALO_VIGILANCIA, |act, ctx| act.vigilar_lider(ctx));
+        // Caso C: commits decididos sin confirmar se reintentan (también cubre
+        // a los recuperados de disco tras un reinicio).
+        ctx.run_interval(self.intervalo_reintento_commits, |act, ctx| {
+            act.reintentar_commits(ctx)
+        });
     }
 }
 
@@ -745,6 +894,36 @@ impl Handler<ConsultarPendientes> for Estacion {
 
     fn handle(&mut self, _msg: ConsultarPendientes, _ctx: &mut Self::Context) -> usize {
         self.eventos_pendientes.len()
+    }
+}
+
+impl Handler<RegistrarCommitPendiente> for Estacion {
+    type Result = ();
+
+    fn handle(&mut self, msg: RegistrarCommitPendiente, _ctx: &mut Self::Context) {
+        self.commits_pendientes.insert(msg.tx_id, msg.preauth_id);
+        // La respuesta de este handler ES la garantía: el 2PC espera este send
+        // antes de mandar el Commit, así que al persistir acá la constancia
+        // queda en disco antes de que el Commit salga a la red.
+        self.persistir();
+    }
+}
+
+impl Handler<CommitConfirmado> for Estacion {
+    type Result = ();
+
+    fn handle(&mut self, msg: CommitConfirmado, _ctx: &mut Self::Context) {
+        if self.commits_pendientes.remove(&msg.tx_id).is_some() {
+            self.persistir();
+        }
+    }
+}
+
+impl Handler<ConsultarCommitsPendientes> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarCommitsPendientes, _ctx: &mut Self::Context) -> usize {
+        self.commits_pendientes.len()
     }
 }
 
@@ -858,6 +1037,7 @@ impl Handler<ProcesarDevolucion> for Estacion {
                 if datos.estacion_origen == actor.id {
                     if let Some(alquiler) = actor.alquileres_propios.get_mut(&datos.rental_id) {
                         alquiler.estado = EstadoAlquiler::Cerrado;
+                        actor.persistir();
                     }
                 } else if let Some(destino) = actor.estaciones.get(&datos.estacion_origen).copied()
                 {
@@ -979,6 +1159,7 @@ async fn procesar_operacion(
         estacion_origen,
         pasarela,
         comunicador,
+        yo,
     } = ctx;
 
     match operacion {
@@ -1036,17 +1217,34 @@ async fn procesar_operacion(
                     .await
                     .ok()
                     .flatten();
+                // Caso C: constancia (persistida) de la decisión ANTES de
+                // mandar el Commit. Si el proceso se cae acá en el medio, el
+                // reintento periódico lo completa al volver (la pasarela es
+                // idempotente al re-Commit).
+                let _ = yo
+                    .send(RegistrarCommitPendiente {
+                        tx_id: tx_id.clone(),
+                        preauth_id: preauth_id.clone(),
+                    })
+                    .await;
                 let commit = MensajeEstacionAPasarela::CommitPreauth {
-                    tx_id,
+                    tx_id: tx_id.clone(),
                     preauth_id: preauth_id.clone(),
                 };
                 // También con plazo: una pasarela colgada acá no debe dejar al
-                // usuario esperando (Caso C: ella completa el commit al volver).
-                let _ = comun::tiempo::con_timeout(
+                // usuario esperando (el reintento se encarga después).
+                let respuesta_commit = comun::tiempo::con_timeout(
                     TIMEOUT_PREPARE,
                     consultar_pasarela(&comunicador, pasarela, &commit),
                 )
-                .await;
+                .await
+                .flatten();
+                if matches!(
+                    respuesta_commit,
+                    Some(MensajePasarelaAEstacion::PreauthConfirmada { .. })
+                ) {
+                    yo.do_send(CommitConfirmado { tx_id });
+                }
 
                 match bici {
                     Some(bici_id) => {
@@ -1138,7 +1336,7 @@ impl Handler<SolicitudUsuario> for Estacion {
     type Result = ResponseActFuture<Self, MensajeEstacionAUsuario>;
 
     fn handle(&mut self, msg: SolicitudUsuario, _ctx: &mut Self::Context) -> Self::Result {
-        let ctx = self.contexto();
+        let ctx = self.contexto(_ctx);
         Box::pin(
             async move { procesar_operacion(msg.0, ctx).await }
                 .into_actor(self)
@@ -1146,6 +1344,7 @@ impl Handler<SolicitudUsuario> for Estacion {
                     if let Some(a) = alquiler {
                         actor.reportar_alquiler(&a, ctx);
                         actor.alquileres_propios.insert(a.rental_id.clone(), a);
+                        actor.persistir();
                     }
                     if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta {
                         ctx.address().do_send(ProcesarDevolucion {
@@ -1206,7 +1405,7 @@ impl Handler<PaqueteRecibido> for Estacion {
                 Box::pin(async {}.into_actor(self).map(|_, _, _| ()))
             }
             (Some(MensajeUsuario::Operacion(operacion)), Some(responder)) => {
-                let ctx = self.contexto();
+                let ctx = self.contexto(ctx);
                 Box::pin(
                     async move {
                         let (respuesta, alquiler) = procesar_operacion(operacion, ctx).await;
@@ -1217,6 +1416,7 @@ impl Handler<PaqueteRecibido> for Estacion {
                         if let Some(a) = alquiler {
                             actor.reportar_alquiler(&a, ctx);
                             actor.alquileres_propios.insert(a.rental_id.clone(), a);
+                            actor.persistir();
                         }
                         if let MensajeEstacionAUsuario::DevolucionAceptada { bici_id } = &respuesta
                         {
@@ -1946,6 +2146,155 @@ mod tests {
                 }
                 otro => panic!("esperaba DevolucionProcesada tras el reintento, fue {otro:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn los_alquileres_propios_sobreviven_un_reinicio() {
+        System::new().block_on(async {
+            let ruta = std::env::temp_dir().join("tp-bicis-test-estacion-reinicio.json");
+            let _ = std::fs::remove_file(&ruta);
+            let pasarela = pasarela_mock(true);
+            let lider = "127.0.0.1:9".parse().unwrap();
+
+            // "Primera corrida": la estación (líder por config) alquila y persiste.
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let e1 = Estacion::new(
+                EstacionId(1),
+                (0.0, 0.0),
+                vec![s0],
+                pasarela,
+                (EstacionId(1), lider),
+                true,
+                HashMap::new(),
+            )
+            .con_persistencia(ruta.clone())
+            .start();
+            let comunicador = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                e1.clone().recipient(),
+            )
+            .start();
+            e1.send(RegistrarComunicador(comunicador)).await.unwrap();
+            let resp = e1.send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::AlquilerConfirmado { .. }
+            ));
+            assert_eq!(e1.send(ConsultarRegistro).await.unwrap(), 1);
+
+            // "Reinicio": otra instancia con el mismo archivo recupera sus
+            // alquileres y, como arranca de líder, repuebla su registro.
+            let e2 = Estacion::new(
+                EstacionId(1),
+                (0.0, 0.0),
+                vec![],
+                pasarela,
+                (EstacionId(1), lider),
+                true,
+                HashMap::new(),
+            )
+            .con_persistencia(ruta.clone())
+            .start();
+            assert_eq!(
+                e2.send(ConsultarRegistro).await.unwrap(),
+                1,
+                "el alquiler activo sobrevive el reinicio"
+            );
+
+            let _ = std::fs::remove_file(&ruta);
+        });
+    }
+
+    /// Pasarela con guion para el Caso C: vota Sí al Prepare, "pierde" el
+    /// primer Commit (cierra la conexión sin responder) y confirma el segundo.
+    fn pasarela_mock_commit_perdido() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut commits = 0u32;
+            for conexion in listener.incoming() {
+                let Ok(mut stream) = conexion else { continue };
+                let mut desen = Desenmarcador::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    desen.alimentar(&buf[..n]);
+                    if let Some(payload) = desen.siguiente_payload() {
+                        let pedido: MensajeEstacionAPasarela =
+                            comun::serializacion::desde_bytes(&payload).unwrap();
+                        if matches!(pedido, MensajeEstacionAPasarela::CommitPreauth { .. }) {
+                            commits += 1;
+                            if commits == 1 {
+                                break; // primer Commit: se "pierde" (sin respuesta)
+                            }
+                        }
+                        let resp = responder_mock(pedido, true);
+                        let _ = stream.write_all(&enmarcar(&resp).unwrap());
+                        break;
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn un_commit_perdido_se_completa_con_el_reintento() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock_commit_perdido();
+            let lider = "127.0.0.1:9".parse().unwrap();
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = Estacion::new(
+                EstacionId(1),
+                (0.0, 0.0),
+                vec![s0],
+                pasarela,
+                (EstacionId(1), lider),
+                true,
+                HashMap::new(),
+            )
+            .con_intervalo_de_reintento(std::time::Duration::from_millis(300))
+            .start();
+            let comunicador = Comunicador::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                estacion.clone().recipient(),
+            )
+            .start();
+            estacion
+                .send(RegistrarComunicador(comunicador))
+                .await
+                .unwrap();
+
+            // El alquiler se confirma igual (la decisión ya era COMMIT), pero
+            // la constancia queda pendiente porque la pasarela no respondió.
+            let resp = estacion.send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::AlquilerConfirmado { .. }
+            ));
+            assert_eq!(
+                estacion.send(ConsultarCommitsPendientes).await.unwrap(),
+                1,
+                "el commit sin confirmar queda registrado"
+            );
+
+            // El reintento periódico completa el Commit (la pasarela responde
+            // al segundo intento) y la constancia se borra.
+            let mut pendientes = usize::MAX;
+            for _ in 0..30 {
+                actix::clock::sleep(std::time::Duration::from_millis(200)).await;
+                pendientes = estacion.send(ConsultarCommitsPendientes).await.unwrap();
+                if pendientes == 0 {
+                    break;
+                }
+            }
+            assert_eq!(pendientes, 0, "el reintento debe completar el commit");
         });
     }
 

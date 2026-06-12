@@ -55,6 +55,29 @@ pub struct ConsultarLider;
 #[rtype(result = "usize")]
 pub struct ConsultarPendientes;
 
+/// El 2PC decidió COMMIT: se deja constancia (persistida) ANTES de mandarle el
+/// `CommitPreauth` a la pasarela, así un crash en el medio se completa al
+/// reiniciar (Caso C). Se responde recién después de persistir.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct RegistrarCommitPendiente {
+    pub tx_id: TransaccionId,
+    pub preauth_id: String,
+}
+
+/// La pasarela confirmó el Commit: la constancia se borra.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct CommitConfirmado {
+    pub tx_id: TransaccionId,
+}
+
+/// Consulta de diagnóstico: cuántos commits decididos siguen sin confirmación
+/// de la pasarela.
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarCommitsPendientes;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InfoLider {
     /// `None` si hay una elección en curso o todavía no se conoce al líder.
