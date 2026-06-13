@@ -42,11 +42,12 @@ pub enum MensajeUsuarioAEstacion {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MensajeEstacionAUsuario {
-    /// CU1 — 2PC exitoso.
+    /// CU1 — 2PC exitoso. `preauth_id` es `None` si el alquiler se resolvió
+    /// sin la pasarela (modo offline, Caso E): el pago queda pendiente.
     AlquilerConfirmado {
         rental_id: RentalId,
         bici_id: BiciId,
-        preauth_id: String,
+        preauth_id: Option<String>,
     },
     /// CU1 — algún participante votó No (slot vacío, tarjeta inválida, ...).
     AlquilerRechazado { motivo: String },

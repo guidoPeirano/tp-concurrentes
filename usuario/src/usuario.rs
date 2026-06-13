@@ -78,7 +78,7 @@ mod tests {
         MensajeEstacionAUsuario::AlquilerConfirmado {
             rental_id: RentalId("R1".to_string()),
             bici_id: BiciId(7),
-            preauth_id: "local".to_string(),
+            preauth_id: Some("local".to_string()),
         }
     }
 

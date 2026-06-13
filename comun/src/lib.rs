@@ -69,7 +69,7 @@ mod tests {
             estacion_origen: EstacionId(1),
             inicio: Timestamp(1_000),
             fin: Some(Timestamp(61_000)),
-            preauth_id: "p123".to_string(),
+            preauth_id: Some("p123".to_string()),
             estado: EstadoAlquiler::Activo,
         });
     }
