@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use actix::prelude::*;
-use comun::comunicador::{Comunicador, ConsultarTcp, EnviarTcp, PaqueteRecibido};
+use comun::comunicador::{Comunicador, ConsultarTcp, EnviarTcp, PaqueteRecibido, Responder};
 use comun::mensajes::estacion_estacion::MensajeEntreEstacionesTCP;
 use comun::mensajes::estacion_pasarela::{
     MensajeEstacionAPasarela, MensajePasarelaAEstacion, VotoResultado,
@@ -110,6 +110,70 @@ impl Estacion {
                     });
                 }
             }
+        }
+    }
+
+    /// Maneja un mensaje que llegó de otra estación. Son sincrónicos (consultas al
+    /// registro local). El líder responde `NotificarDevolucion` con los datos de
+    /// cobro y cierra el alquiler con `DevolucionProcesada`.
+    fn manejar_entre_estaciones(
+        &mut self,
+        msg: MensajeEntreEstacionesTCP,
+        responder: Option<Responder>,
+    ) {
+        match msg {
+            MensajeEntreEstacionesTCP::AlquilerAbierto {
+                rental_id,
+                bici_id,
+                usuario_id,
+                estacion_origen,
+                t0,
+                preauth_id,
+                ..
+            } => {
+                if let RolEstacion::Lider(registro) = &mut self.rol {
+                    registro.agregar(Alquiler {
+                        rental_id,
+                        bici_id,
+                        usuario_id,
+                        estacion_origen,
+                        inicio: t0,
+                        fin: None,
+                        preauth_id,
+                        estado: EstadoAlquiler::Activo,
+                    });
+                }
+            }
+            MensajeEntreEstacionesTCP::NotificarDevolucion {
+                event_id, bici_id, ..
+            } => {
+                let respuesta = match &self.rol {
+                    RolEstacion::Lider(registro) => match registro.buscar_por_bici(bici_id) {
+                        Some(a) => MensajeEntreEstacionesTCP::DatosParaCobro {
+                            event_id,
+                            rental_id: a.rental_id.clone(),
+                            preauth_id: a.preauth_id.clone(),
+                            t0: a.inicio,
+                            estacion_origen: a.estacion_origen,
+                        },
+                        None => MensajeEntreEstacionesTCP::NoRegistradoAun { event_id },
+                    },
+                    RolEstacion::Follower => {
+                        MensajeEntreEstacionesTCP::NoRegistradoAun { event_id }
+                    }
+                };
+                if let (Some(r), Ok(bytes)) = (responder, comun::serializacion::a_bytes(&respuesta))
+                {
+                    r.responder(bytes);
+                }
+            }
+            MensajeEntreEstacionesTCP::DevolucionProcesada { rental_id, .. } => {
+                if let RolEstacion::Lider(registro) = &mut self.rol {
+                    registro.cerrar(&rental_id);
+                }
+            }
+            // CierreAlquiler (lado origen) en la 4b-2; Ring en la Etapa 5; huérfanas luego.
+            _ => {}
         }
     }
 
@@ -362,29 +426,11 @@ impl Handler<PaqueteRecibido> for Estacion {
     type Result = ResponseActFuture<Self, ()>;
 
     fn handle(&mut self, msg: PaqueteRecibido, _ctx: &mut Self::Context) -> Self::Result {
-        // ¿Es un reporte de alquiler de otra estación hacia el líder?
-        if let Ok(MensajeEntreEstacionesTCP::AlquilerAbierto {
-            rental_id,
-            bici_id,
-            usuario_id,
-            estacion_origen,
-            t0,
-            preauth_id,
-            ..
-        }) = comun::serializacion::desde_bytes::<MensajeEntreEstacionesTCP>(&msg.datos)
+        // ¿Es un mensaje entre estaciones (reporte/devolución al líder, etc.)?
+        if let Ok(entre_estaciones) =
+            comun::serializacion::desde_bytes::<MensajeEntreEstacionesTCP>(&msg.datos)
         {
-            if let RolEstacion::Lider(registro) = &mut self.rol {
-                registro.agregar(Alquiler {
-                    rental_id,
-                    bici_id,
-                    usuario_id,
-                    estacion_origen,
-                    inicio: t0,
-                    fin: None,
-                    preauth_id,
-                    estado: EstadoAlquiler::Activo,
-                });
-            }
+            self.manejar_entre_estaciones(entre_estaciones, msg.responder);
             return Box::pin(async {}.into_actor(self).map(|_, _, _| ()));
         }
 
@@ -419,8 +465,20 @@ impl Handler<PaqueteRecibido> for Estacion {
 mod tests {
     use super::*;
     use crate::mensajes::ConsultarEstado;
+    use comun::comunicador::Transporte;
     use comun::framing::{enmarcar, Desenmarcador};
     use comun::{BiciId, DatosTarjeta, UsuarioId};
+
+    fn paquete_tcp(
+        msg: &MensajeEntreEstacionesTCP,
+        responder: Option<Responder>,
+    ) -> PaqueteRecibido {
+        PaqueteRecibido {
+            transporte: Transporte::Tcp,
+            datos: comun::serializacion::a_bytes(msg).unwrap(),
+            responder,
+        }
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -555,6 +613,78 @@ mod tests {
             let _ = estacion.send(alquilar(0)).await.unwrap();
             // El alquiler exitoso se reportó al registro (esta estación es el líder).
             assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn el_lider_responde_datos_para_cobro_y_cierra_con_devolucion_procesada() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = arrancar(vec![s0], pasarela).await; // es líder
+            let _ = estacion.send(alquilar(0)).await.unwrap(); // registra la bici 42
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
+
+            // La destino notifica la devolución → el líder responde DatosParaCobro.
+            let (responder, rx) = Responder::canal();
+            let notif = MensajeEntreEstacionesTCP::NotificarDevolucion {
+                event_id: EventId("E1".to_string()),
+                bici_id: BiciId(42),
+                estacion_destino: EstacionId(2),
+                t1: Timestamp(60_000),
+            };
+            estacion
+                .send(paquete_tcp(&notif, Some(responder)))
+                .await
+                .unwrap();
+            let reply: MensajeEntreEstacionesTCP =
+                comun::serializacion::desde_bytes(&rx.recv().unwrap()).unwrap();
+            let rental = match reply {
+                MensajeEntreEstacionesTCP::DatosParaCobro {
+                    rental_id,
+                    preauth_id,
+                    ..
+                } => {
+                    assert_eq!(preauth_id, "P-mock");
+                    rental_id
+                }
+                otro => panic!("esperaba DatosParaCobro, fue {otro:?}"),
+            };
+
+            // La destino confirma el cobro → el líder cierra el alquiler.
+            let procesada = MensajeEntreEstacionesTCP::DevolucionProcesada {
+                event_id: EventId("E1".to_string()),
+                rental_id: rental,
+                monto_cobrado: 70.0,
+                tiempo_uso_minutos: 1,
+            };
+            estacion.send(paquete_tcp(&procesada, None)).await.unwrap();
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn notificar_devolucion_de_bici_desconocida_responde_no_registrado() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let estacion = arrancar(vec![], pasarela).await; // líder sin alquileres
+            let (responder, rx) = Responder::canal();
+            let notif = MensajeEntreEstacionesTCP::NotificarDevolucion {
+                event_id: EventId("E1".to_string()),
+                bici_id: BiciId(999),
+                estacion_destino: EstacionId(2),
+                t1: Timestamp(0),
+            };
+            estacion
+                .send(paquete_tcp(&notif, Some(responder)))
+                .await
+                .unwrap();
+            let reply: MensajeEntreEstacionesTCP =
+                comun::serializacion::desde_bytes(&rx.recv().unwrap()).unwrap();
+            assert!(matches!(
+                reply,
+                MensajeEntreEstacionesTCP::NoRegistradoAun { .. }
+            ));
         });
     }
 

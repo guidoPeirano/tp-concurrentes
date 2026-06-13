@@ -36,6 +36,13 @@ impl Responder {
     pub fn responder(self, datos: Vec<u8>) {
         let _ = self.tx.send(datos);
     }
+
+    /// Crea un `Responder` suelto junto con el extremo receptor. Útil para tests:
+    /// permite simular un pedido con respuesta y leer lo que el actor contesta.
+    pub fn canal() -> (Responder, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel();
+        (Responder { tx }, rx)
+    }
 }
 
 /// Un payload (bytes ya desenmarcados) recibido de la red. El Comunicador se lo

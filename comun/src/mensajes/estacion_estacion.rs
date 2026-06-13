@@ -25,6 +25,18 @@ pub enum MensajeEntreEstacionesTCP {
         estacion_destino: EstacionId,
         t1: Timestamp,
     },
+    /// CU2 — el líder le pasa a la estación destino los datos para cobrar.
+    DatosParaCobro {
+        event_id: EventId,
+        rental_id: RentalId,
+        preauth_id: String,
+        t0: Timestamp,
+        estacion_origen: EstacionId,
+    },
+    /// CU2 — el líder todavía no tiene registrado ese alquiler (la destino reintenta).
+    NoRegistradoAun {
+        event_id: EventId,
+    },
     /// CU2 — la estación destino le informa al líder el resultado del cobro.
     DevolucionProcesada {
         event_id: EventId,
