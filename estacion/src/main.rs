@@ -52,6 +52,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .direccion_lider()
         .ok_or("el líder de la config no está en la lista de estaciones")?;
     let es_lider = id == config.lider;
+    // Direcciones de todas las estaciones (para alcanzar al origen en la devolución).
+    let estaciones: std::collections::HashMap<EstacionId, SocketAddr> = config
+        .estaciones
+        .iter()
+        .map(|e| (e.id, SocketAddr::from(([127, 0, 0, 1], e.puerto))))
+        .collect();
 
     let system = System::new();
     let _actores = system.block_on(async move {
@@ -74,6 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             pasarela_addr,
             lider_addr,
             es_lider,
+            estaciones,
         )
         .start();
         let comunicador =

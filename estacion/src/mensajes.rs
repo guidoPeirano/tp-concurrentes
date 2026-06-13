@@ -4,7 +4,17 @@
 use actix::prelude::*;
 use comun::comunicador::Comunicador;
 use comun::mensajes::usuario_estacion::{MensajeEstacionAUsuario, MensajeUsuarioAEstacion};
-use comun::{BiciId, TransaccionId};
+use comun::{BiciId, Timestamp, TransaccionId};
+
+/// Mensaje que la estación destino se manda a sí misma para correr el cierre de
+/// la devolución **en background** (consultar al líder, cobrar, cerrar), después
+/// de haberle respondido `DevolucionAceptada` al usuario.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ProcesarDevolucion {
+    pub bici_id: BiciId,
+    pub t1: Timestamp,
+}
 
 /// Un pedido de usuario (alquiler/devolución) que la estación procesa localmente:
 /// rutea al slot que corresponde y coordina el 2PC. Envuelve el mensaje de red

@@ -140,3 +140,92 @@ fn flujo_completo_por_la_repl() {
         "el estado final debería ser SinBici. salida:\n{salida}"
     );
 }
+
+/// Config de dos estaciones (1 = líder, 2 = follower) + pasarela, en puertos
+/// propios de este test.
+fn escribir_config_multi() -> PathBuf {
+    let ruta = std::env::temp_dir().join(format!("tp_e2e_multi_{}.json", std::process::id()));
+    let contenido = r#"{
+  "estaciones": [
+    { "id": 1, "puerto": 18921, "ubicacion": [-34.60, -58.40] },
+    { "id": 2, "puerto": 18922, "ubicacion": [-34.61, -58.41] }
+  ],
+  "pasarela": { "puerto": 19021 },
+  "tarifa": { "base": 50.0, "por_minuto": 10.0 },
+  "lider": 1
+}"#;
+    std::fs::write(&ruta, contenido).expect("escribir config temporal");
+    ruta
+}
+
+#[test]
+fn alquilar_en_una_estacion_y_devolver_en_otra() {
+    let config = escribir_config_multi();
+    let config = config.to_str().unwrap();
+
+    // Líder + origen (estación 1), destino (estación 2), pasarela.
+    let _pasarela = Proceso(
+        Command::new(bin("pasarela"))
+            .args(["--puerto", "19021", "--config", config])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pasarela"),
+    );
+    let _estacion1 = Proceso(
+        Command::new(bin("estacion"))
+            .args(["--id", "1", "--puerto", "18921", "--config", config])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn estacion 1"),
+    );
+    let _estacion2 = Proceso(
+        Command::new(bin("estacion"))
+            .args(["--id", "2", "--puerto", "18922", "--config", config])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn estacion 2"),
+    );
+    esperar_puerto(19021);
+    esperar_puerto(18921);
+    esperar_puerto(18922);
+
+    // Alquila en la estación 1 (slot 0, con bici) y devuelve en la estación 2
+    // (slot 5, vacío). La estación 2 consulta al líder (estación 1), cobra y cierra.
+    let mut usuario = Command::new(bin("usuario"))
+        .args(["--id", "bob", "--config", config])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn usuario");
+    let comandos = "\
+        alquilar 1 0\n\
+        estado\n\
+        devolver 2 5\n\
+        estado\n\
+        salir\n";
+    usuario
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(comandos.as_bytes())
+        .expect("escribir comandos");
+    let mut salida = String::new();
+    usuario
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut salida)
+        .expect("leer salida");
+    usuario.wait().expect("esperar usuario");
+
+    assert!(salida.contains("AlquilerConfirmado"), "salida:\n{salida}");
+    assert!(salida.contains("ConBici"), "salida:\n{salida}");
+    assert!(salida.contains("DevolucionAceptada"), "salida:\n{salida}");
+    assert!(
+        salida.trim_end().ends_with("SinBici"),
+        "el estado final debería ser SinBici. salida:\n{salida}"
+    );
+}
