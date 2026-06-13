@@ -25,6 +25,18 @@ pub struct ProcesarDevolucion {
 #[rtype(result = "usize")]
 pub struct ConsultarHuerfanas;
 
+/// Consulta de diagnóstico: cuántos alquileres offline esperan regularización
+/// (obtener su preauth diferida cuando vuelva la pasarela).
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarPagosPendientes;
+
+/// Consulta de diagnóstico: cuántas regularizaciones fracasaron (la pasarela
+/// rechazó la tarjeta): alquileres que ya no se van a cobrar (CobroFallido).
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarCobrosFallidos;
+
 /// Un pedido de usuario (alquiler/devolución) que la estación procesa localmente:
 /// rutea al slot que corresponde y coordina el 2PC. Envuelve el mensaje de red
 /// para poder enviarlo como mensaje de actor. La respuesta es la misma que iría
