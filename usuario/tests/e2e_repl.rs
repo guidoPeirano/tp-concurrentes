@@ -56,7 +56,8 @@ fn escribir_config(puerto_estacion: u16, puerto_pasarela: u16) -> PathBuf {
     {{ "id": 1, "puerto": {puerto_estacion}, "ubicacion": [-34.6, -58.4] }}
   ],
   "pasarela": {{ "puerto": {puerto_pasarela} }},
-  "tarifa": {{ "base": 50.0, "por_minuto": 10.0 }}
+  "tarifa": {{ "base": 50.0, "por_minuto": 10.0 }},
+  "lider": 1
 }}"#
     );
     std::fs::write(&ruta, contenido).expect("escribir config temporal");

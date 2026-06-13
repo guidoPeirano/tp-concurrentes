@@ -12,20 +12,29 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use actix::prelude::*;
-use comun::comunicador::{Comunicador, ConsultarTcp, PaqueteRecibido};
+use comun::comunicador::{Comunicador, ConsultarTcp, EnviarTcp, PaqueteRecibido};
+use comun::mensajes::estacion_estacion::MensajeEntreEstacionesTCP;
 use comun::mensajes::estacion_pasarela::{
     MensajeEstacionAPasarela, MensajePasarelaAEstacion, VotoResultado,
 };
 use comun::mensajes::usuario_estacion::{
     MensajeEstacionAUsuario, MensajeUsuario, MensajeUsuarioAEstacion,
 };
-use comun::{Alquiler, EstacionId, EstadoAlquiler, RentalId, Timestamp, TransaccionId};
+use comun::{Alquiler, EstacionId, EstadoAlquiler, EventId, RentalId, Timestamp, TransaccionId};
 
 use crate::mensajes::{
-    AbortLiberacion, AceptarBici, CommitLiberacion, PrepareLiberacion, RegistrarComunicador,
-    SolicitudUsuario, Voto,
+    AbortLiberacion, AceptarBici, CommitLiberacion, ConsultarRegistro, PrepareLiberacion,
+    RegistrarComunicador, SolicitudUsuario, Voto,
 };
+use crate::registro::Registro;
 use crate::slot::Slot;
+
+/// Rol de la estación: una es el líder (mantiene el registro autoritativo), el
+/// resto son followers.
+enum RolEstacion {
+    Lider(Registro),
+    Follower,
+}
 
 /// Monto que se pre-autoriza (reserva) al iniciar un alquiler. Provisorio fijo.
 const MONTO_RESERVA: f64 = 1000.0;
@@ -35,10 +44,13 @@ pub struct Estacion {
     ubicacion: (f64, f64),
     slots: Vec<Addr<Slot>>,
     pasarela: SocketAddr,
+    /// Dirección del líder (a quién reportar los alquileres si soy follower).
+    lider: SocketAddr,
+    rol: RolEstacion,
     /// `Addr` del Comunicador propio (se cablea al arrancar con `RegistrarComunicador`).
     comunicador: Option<Addr<Comunicador>>,
     alquileres_propios: HashMap<RentalId, Alquiler>,
-    /// Contador para generar ids únicos de transacción y de alquiler.
+    /// Contador para generar ids únicos de transacción, alquiler y evento.
     contador: u64,
 }
 
@@ -48,12 +60,20 @@ impl Estacion {
         ubicacion: (f64, f64),
         slots: Vec<Addr<Slot>>,
         pasarela: SocketAddr,
+        lider: SocketAddr,
+        es_lider: bool,
     ) -> Self {
         Self {
             id,
             ubicacion,
             slots,
             pasarela,
+            lider,
+            rol: if es_lider {
+                RolEstacion::Lider(Registro::new())
+            } else {
+                RolEstacion::Follower
+            },
             comunicador: None,
             alquileres_propios: HashMap::new(),
             contador: 0,
@@ -63,6 +83,34 @@ impl Estacion {
     fn proximo(&mut self) -> u64 {
         self.contador += 1;
         self.contador
+    }
+
+    /// Reporta un alquiler recién abierto al líder. Si esta estación ES el líder,
+    /// lo registra directo; si es follower, se lo manda por el Comunicador.
+    fn reportar_alquiler(&mut self, alquiler: &Alquiler) {
+        let n = self.proximo();
+        let abierto = MensajeEntreEstacionesTCP::AlquilerAbierto {
+            event_id: EventId(format!("E-{}-{}", self.id.0, n)),
+            rental_id: alquiler.rental_id.clone(),
+            bici_id: alquiler.bici_id,
+            usuario_id: alquiler.usuario_id.clone(),
+            estacion_origen: alquiler.estacion_origen,
+            t0: alquiler.inicio,
+            preauth_id: alquiler.preauth_id.clone(),
+        };
+        match &mut self.rol {
+            RolEstacion::Lider(registro) => registro.agregar(alquiler.clone()),
+            RolEstacion::Follower => {
+                if let (Some(comunicador), Ok(bytes)) =
+                    (&self.comunicador, comun::serializacion::a_bytes(&abierto))
+                {
+                    comunicador.do_send(EnviarTcp {
+                        destino: self.lider,
+                        datos: bytes,
+                    });
+                }
+            }
+        }
     }
 
     /// Datos que necesita `procesar_operacion`, capturados antes del trabajo async.
@@ -108,6 +156,17 @@ impl Handler<RegistrarComunicador> for Estacion {
 
     fn handle(&mut self, msg: RegistrarComunicador, _ctx: &mut Self::Context) {
         self.comunicador = Some(msg.0);
+    }
+}
+
+impl Handler<ConsultarRegistro> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarRegistro, _ctx: &mut Self::Context) -> usize {
+        match &self.rol {
+            RolEstacion::Lider(registro) => registro.activos(),
+            RolEstacion::Follower => 0,
+        }
     }
 }
 
@@ -290,6 +349,7 @@ impl Handler<SolicitudUsuario> for Estacion {
                 .into_actor(self)
                 .map(|(respuesta, alquiler), actor, _ctx| {
                     if let Some(a) = alquiler {
+                        actor.reportar_alquiler(&a);
                         actor.alquileres_propios.insert(a.rental_id.clone(), a);
                     }
                     respuesta
@@ -302,6 +362,32 @@ impl Handler<PaqueteRecibido> for Estacion {
     type Result = ResponseActFuture<Self, ()>;
 
     fn handle(&mut self, msg: PaqueteRecibido, _ctx: &mut Self::Context) -> Self::Result {
+        // ¿Es un reporte de alquiler de otra estación hacia el líder?
+        if let Ok(MensajeEntreEstacionesTCP::AlquilerAbierto {
+            rental_id,
+            bici_id,
+            usuario_id,
+            estacion_origen,
+            t0,
+            preauth_id,
+            ..
+        }) = comun::serializacion::desde_bytes::<MensajeEntreEstacionesTCP>(&msg.datos)
+        {
+            if let RolEstacion::Lider(registro) = &mut self.rol {
+                registro.agregar(Alquiler {
+                    rental_id,
+                    bici_id,
+                    usuario_id,
+                    estacion_origen,
+                    inicio: t0,
+                    fin: None,
+                    preauth_id,
+                    estado: EstadoAlquiler::Activo,
+                });
+            }
+            return Box::pin(async {}.into_actor(self).map(|_, _, _| ()));
+        }
+
         let pedido: Option<MensajeUsuario> = comun::serializacion::desde_bytes(&msg.datos).ok();
 
         match (pedido, msg.responder) {
@@ -315,6 +401,7 @@ impl Handler<PaqueteRecibido> for Estacion {
                     .into_actor(self)
                     .map(|(respuesta, alquiler, responder), actor, _ctx| {
                         if let Some(a) = alquiler {
+                            actor.reportar_alquiler(&a);
                             actor.alquileres_propios.insert(a.rental_id.clone(), a);
                         }
                         if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
@@ -354,9 +441,12 @@ mod tests {
         })
     }
 
-    /// Crea la estación con su Comunicador cableado (igual que en `main`).
+    /// Crea la estación (como líder) con su Comunicador cableado (igual que en `main`).
     async fn arrancar(slots: Vec<Addr<Slot>>, pasarela: SocketAddr) -> Addr<Estacion> {
-        let estacion = Estacion::new(EstacionId(1), (0.0, 0.0), slots, pasarela).start();
+        // Como es líder, registra sus propios alquileres; la dirección de líder no se usa.
+        let lider = "127.0.0.1:9".parse().unwrap();
+        let estacion =
+            Estacion::new(EstacionId(1), (0.0, 0.0), slots, pasarela, lider, true).start();
         let comunicador = Comunicador::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -451,6 +541,20 @@ mod tests {
                 !s0.send(ConsultarEstado).await.unwrap().ocupado,
                 "el slot quedó vacío"
             );
+        });
+    }
+
+    #[test]
+    fn el_lider_registra_el_alquiler() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let s0 = Slot::con_bici(0, BiciId(42)).start();
+            let estacion = arrancar(vec![s0], pasarela).await;
+
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
+            let _ = estacion.send(alquilar(0)).await.unwrap();
+            // El alquiler exitoso se reportó al registro (esta estación es el líder).
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 1);
         });
     }
 

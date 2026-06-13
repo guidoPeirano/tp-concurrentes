@@ -21,6 +21,12 @@ pub struct SolicitudUsuario(pub MensajeUsuarioAEstacion);
 #[rtype(result = "()")]
 pub struct RegistrarComunicador(pub Addr<Comunicador>);
 
+/// Consulta de diagnóstico: cuántos alquileres activos tiene el registro del líder
+/// (devuelve 0 si esta estación no es el líder).
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarRegistro;
+
 /// Fase Prepare del 2PC sobre el `Slot`: pide reservar la bici para una
 /// transacción. Responde con el voto.
 #[derive(Message)]

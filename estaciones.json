@@ -5,5 +5,6 @@
     { "id": 3, "puerto": 8003, "ubicacion": [-34.6200, -58.3900] }
   ],
   "pasarela": { "puerto": 9000 },
-  "tarifa": { "base": 50.0, "por_minuto": 10.0 }
+  "tarifa": { "base": 50.0, "por_minuto": 10.0 },
+  "lider": 1
 }
