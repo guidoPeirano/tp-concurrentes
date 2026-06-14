@@ -17,6 +17,10 @@ pub struct ProcesarDevolucion {
     /// `true` si este es el reintento posterior a una recuperación de huérfana:
     /// si vuelve a fallar, la bici se confirma huérfana (no se busca de nuevo).
     pub ya_reprocesada: bool,
+    /// Número de intento (arranca en 0). Cada reintento es un mensaje nuevo en
+    /// vez de un loop: así toma el líder VIGENTE en ese momento (si hubo una
+    /// elección en el medio, el reintento ya le habla al líder nuevo).
+    pub intento: u32,
 }
 
 /// Consulta de diagnóstico: cuántas bicis quedaron confirmadas como huérfanas
@@ -24,6 +28,12 @@ pub struct ProcesarDevolucion {
 #[derive(Message)]
 #[rtype(result = "usize")]
 pub struct ConsultarHuerfanas;
+
+/// Consulta de diagnóstico: cuántos alquileres propios siguen activos (sirve
+/// para verificar de punta a punta que un cierre llegó hasta el origen).
+#[derive(Message)]
+#[rtype(result = "usize")]
+pub struct ConsultarPropiosActivos;
 
 /// Consulta de diagnóstico: cuántos alquileres offline esperan regularización
 /// (obtener su preauth diferida cuando vuelva la pasarela).

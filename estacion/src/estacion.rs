@@ -50,8 +50,13 @@ const TIMEOUT_PREPARE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Intentos de `NotificarDevolucion` al líder antes de dar a la bici por
 /// huérfana (el líder pudo responder `NoRegistradoAun` si el reporte del origen
-/// todavía no le llegó).
-const REINTENTOS_NOTIFICACION: u32 = 4;
+/// todavía no le llegó, o puede haber una elección en curso).
+const REINTENTOS_NOTIFICACION: u32 = 5;
+
+/// Cuánto espera el que reenvía un mensaje del Ring el ACK del siguiente nodo.
+/// Un nodo COLGADO acepta la conexión (lo hace el kernel) pero nunca contesta:
+/// sin este ACK el anillo lo daría por entregado y la elección se trabaría.
+const TIMEOUT_ACK_RING: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Espera base entre reintentos de `NotificarDevolucion` (crece linealmente).
 const ESPERA_REINTENTO: std::time::Duration = std::time::Duration::from_millis(500);
@@ -68,9 +73,9 @@ use crate::eleccion::{AccionRing, Eleccion, EstadoLider};
 use crate::mensajes::{
     AbortLiberacion, AceptarBici, CommitConfirmado, CommitLiberacion, ConsultarCache,
     ConsultarCobrosFallidos, ConsultarCommitsPendientes, ConsultarEstado, ConsultarHuerfanas,
-    ConsultarLider, ConsultarPagosPendientes, ConsultarPendientes, ConsultarRegistro, InfoLider,
-    PrepareLiberacion, ProcesarDevolucion, RegistrarCommitPendiente, RegistrarComunicador,
-    SolicitudUsuario, Voto,
+    ConsultarLider, ConsultarPagosPendientes, ConsultarPendientes, ConsultarPropiosActivos,
+    ConsultarRegistro, InfoLider, PrepareLiberacion, ProcesarDevolucion, RegistrarCommitPendiente,
+    RegistrarComunicador, SolicitudUsuario, Voto,
 };
 use crate::registro::Registro;
 use crate::slot::Slot;
@@ -538,6 +543,7 @@ impl Estacion {
             bici_id,
             t1,
             ya_reprocesada: true,
+            intento: 0,
         });
     }
 
@@ -723,11 +729,16 @@ impl Estacion {
             }
 
             // --- Ring de elección (CU4) ---
+            // Los mensajes del anillo se ACKean: el que reenvía solo da por
+            // entregado si recibe respuesta (un nodo colgado acepta la conexión
+            // pero no contesta, y sin ACK la elección se trabaría en él).
             MensajeEntreEstacionesTCP::Election { ids, iniciador } => {
+                ack_ring(responder);
                 let accion = self.eleccion.recibir_election(ids, iniciador);
                 self.procesar_accion_ring(accion, ctx);
             }
             MensajeEntreEstacionesTCP::Coordinator { lider, term } => {
+                ack_ring(responder);
                 let accion = self.eleccion.recibir_coordinator(lider, term);
                 self.procesar_accion_ring(accion, ctx);
             }
@@ -771,13 +782,19 @@ impl Estacion {
         let mi_id = self.id;
         let fut = async move {
             for (id, addr) in direcciones {
-                let entregado = comunicador
-                    .send(EnviarTcpConfirmado {
+                // Entrega con ACK y plazo corto: cubre tanto al nodo caído
+                // (conexión rechazada) como al colgado (acepta y no contesta).
+                let entregado = comun::tiempo::con_timeout(
+                    TIMEOUT_ACK_RING,
+                    comunicador.send(ConsultarTcp {
                         destino: addr,
                         datos: bytes.clone(),
-                    })
-                    .await
-                    .unwrap_or(false);
+                    }),
+                )
+                .await
+                .and_then(|r| r.ok())
+                .flatten()
+                .is_some();
                 if entregado {
                     return;
                 }
@@ -1119,6 +1136,18 @@ struct ContextoOperacion {
     yo: Addr<Estacion>,
 }
 
+/// Contesta el ACK de un mensaje del Ring (si vino con canal de respuesta).
+fn ack_ring(responder: Option<Responder>) {
+    if let (Some(r), Ok(bytes)) = (
+        responder,
+        comun::serializacion::a_bytes(&MensajeEntreEstacionesTCP::EventoProcesadoAck {
+            event_id: EventId("ring-ack".to_string()),
+        }),
+    ) {
+        r.responder(bytes);
+    }
+}
+
 /// Distancia aproximada en km entre dos puntos `(lat, lon)` en grados, con la
 /// fórmula equirectangular (suficiente para distancias urbanas y mucho más barata
 /// que la de Haversine). No usamos crates externas: solo `f64` de la std.
@@ -1227,6 +1256,17 @@ impl Handler<ConsultarHuerfanas> for Estacion {
     }
 }
 
+impl Handler<ConsultarPropiosActivos> for Estacion {
+    type Result = usize;
+
+    fn handle(&mut self, _msg: ConsultarPropiosActivos, _ctx: &mut Self::Context) -> usize {
+        self.alquileres_propios
+            .values()
+            .filter(|a| a.estado == EstadoAlquiler::Activo)
+            .count()
+    }
+}
+
 impl Handler<ConsultarPagosPendientes> for Estacion {
     type Result = usize;
 
@@ -1293,36 +1333,27 @@ impl Handler<ProcesarDevolucion> for Estacion {
         let bici_id = msg.bici_id;
         let t1 = msg.t1;
         let ya_reprocesada = msg.ya_reprocesada;
+        let intento = msg.intento;
         let n = self.proximo();
         let event_id = EventId(format!("E-{}-{}", self.id.0, n));
 
         Box::pin(
             async move {
+                // UN intento por mensaje: si falla, el reintento se re-despacha
+                // como mensaje nuevo (y lee el líder vigente en ESE momento;
+                // si hubo elección en el medio, le habla al líder nuevo).
                 let datos = if es_lider {
                     datos_si_lider
                 } else {
-                    // El líder puede no tener el alquiler todavía (el reporte del
-                    // origen viaja en paralelo): ante NoRegistradoAun (o un fallo
-                    // de red) se reintenta con una espera creciente.
-                    let mut datos = None;
-                    for intento in 0..REINTENTOS_NOTIFICACION {
-                        if intento > 0 {
-                            actix::clock::sleep(ESPERA_REINTENTO * intento).await;
-                        }
-                        datos = consultar_lider_devolucion(
-                            &comunicador,
-                            lider,
-                            event_id.clone(),
-                            bici_id,
-                            mi_id,
-                            t1,
-                        )
-                        .await;
-                        if datos.is_some() {
-                            break;
-                        }
-                    }
-                    datos
+                    consultar_lider_devolucion(
+                        &comunicador,
+                        lider,
+                        event_id.clone(),
+                        bici_id,
+                        mi_id,
+                        t1,
+                    )
+                    .await
                 };
                 let datos = datos?;
                 // Cobro a la pasarela (proporcional a t1 - t0).
@@ -1340,6 +1371,19 @@ impl Handler<ProcesarDevolucion> for Estacion {
             .into_actor(self)
             .map(move |resultado, actor, ctx| {
                 let Some((datos, monto, event_id)) = resultado else {
+                    // ¿Quedan reintentos? Se reprograma con espera creciente.
+                    if intento + 1 < REINTENTOS_NOTIFICACION {
+                        let proximo = ProcesarDevolucion {
+                            bici_id,
+                            t1,
+                            ya_reprocesada,
+                            intento: intento + 1,
+                        };
+                        ctx.run_later(ESPERA_REINTENTO * (intento + 1), move |_, ctx| {
+                            ctx.address().do_send(proximo);
+                        });
+                        return;
+                    }
                     // Agotados los reintentos: protocolo de huérfanas (8.2.1).
                     // Si esto ya era el reproceso post-recuperación, se confirma
                     // huérfana directo (sin buscar de nuevo: evita el loop).
@@ -1748,6 +1792,7 @@ impl Handler<SolicitudUsuario> for Estacion {
                             bici_id: *bici_id,
                             t1: Timestamp::ahora(),
                             ya_reprocesada: false,
+                            intento: 0,
                         });
                     }
                     respuesta
@@ -1827,6 +1872,7 @@ impl Handler<PaqueteRecibido> for Estacion {
                                     bici_id: *bici_id,
                                     t1: Timestamp::ahora(),
                                     ya_reprocesada: false,
+                                    intento: 0,
                                 });
                             }
                             if let Ok(bytes) = comun::serializacion::a_bytes(&respuesta) {
@@ -3155,6 +3201,164 @@ mod tests {
             );
             // Y B no la contó como huérfana confirmada (se recuperó).
             assert_eq!(b.send(ConsultarHuerfanas).await.unwrap(), 0);
+        });
+    }
+
+    /// Escenario combinado 1: la devolución arranca con el líder CAÍDO y una
+    /// elección en el medio. La bici se alquila en la 1 (su reporte queda
+    /// diferido), se devuelve en la 2 mientras no hay líder, y el sistema
+    /// tiene que converger igual: elección, reconstrucción/flush, reintentos
+    /// que le hablan al líder nuevo, cobro y cierre — sin huérfanas falsas.
+    #[test]
+    fn la_devolucion_sobrevive_a_la_caida_del_lider() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let puerto = |id: u32| 19060 + id as u16;
+            let direccion = |id: u32| SocketAddr::from(([127, 0, 0, 1], puerto(id)));
+            let estaciones: HashMap<EstacionId, SocketAddr> = [1, 2, 3, 9]
+                .into_iter()
+                .map(|id| (EstacionId(id), direccion(id)))
+                .collect();
+
+            let mut actores = Vec::new();
+            for id in [1u32, 2, 3] {
+                let slots = if id == 1 {
+                    vec![Slot::con_bici(0, BiciId(41)).start()]
+                } else {
+                    vec![Slot::nuevo(0).start()]
+                };
+                let estacion = Estacion::new(
+                    EstacionId(id),
+                    (0.0, 0.0),
+                    slots,
+                    pasarela,
+                    (EstacionId(9), direccion(9)), // líder por config: muerto
+                    false,
+                    estaciones.clone(),
+                )
+                .start();
+                let comunicador =
+                    Comunicador::new(direccion(id), direccion(id), estacion.clone().recipient())
+                        .start();
+                estacion
+                    .send(RegistrarComunicador(comunicador))
+                    .await
+                    .unwrap();
+                actores.push(estacion);
+            }
+
+            // Alquiler en la 1 (reporte diferido: el líder está muerto)...
+            let resp = actores[0].send(alquilar(0)).await.unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::AlquilerConfirmado { .. }
+            ));
+            // ...y devolución inmediata en la 2, ANTES de que haya elección.
+            let resp = actores[1]
+                .send(SolicitudUsuario(
+                    MensajeUsuarioAEstacion::SolicitudDevolucion {
+                        usuario_id: UsuarioId("alice".to_string()),
+                        bici_id: BiciId(41),
+                        rental_id: RentalId("ignorado".to_string()),
+                        slot_id: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                resp,
+                MensajeEstacionAUsuario::DevolucionAceptada { .. }
+            ));
+
+            // Convergencia: el alquiler termina CERRADO en el origen (le llegó
+            // el CierreAlquiler), el líder electo no tiene activos, y la 2
+            // nunca confirmó una huérfana falsa.
+            let mut convergio = false;
+            for _ in 0..60 {
+                actix::clock::sleep(std::time::Duration::from_millis(500)).await;
+                let propios_activos = actores[0].send(ConsultarPropiosActivos).await.unwrap();
+                let lider = actores[2].send(ConsultarLider).await.unwrap();
+                if propios_activos == 0 && lider.lider_id == Some(EstacionId(3)) {
+                    convergio = true;
+                    break;
+                }
+            }
+            assert!(
+                convergio,
+                "la devolución debería completarse pese a la caída del líder"
+            );
+            assert_eq!(
+                actores[1].send(ConsultarHuerfanas).await.unwrap(),
+                0,
+                "el alquiler existía: no es una huérfana"
+            );
+            assert_eq!(
+                actores[2].send(ConsultarRegistro).await.unwrap(),
+                0,
+                "el líder nuevo no debe tener alquileres activos"
+            );
+        });
+    }
+
+    /// Escenario combinado 2: el líder no está caído sino COLGADO (acepta
+    /// conexiones pero nunca contesta: el kernel completa el handshake aunque
+    /// el proceso no lea). La vigilancia lo detecta por el timeout de lectura
+    /// y el anillo lo saltea gracias al ACK (sin ACK, el Election "entregado"
+    /// al colgado se perdería y la elección quedaría trabada para siempre).
+    #[test]
+    fn lider_colgado_dispara_eleccion_y_el_anillo_lo_saltea() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let puerto = |id: u32| 19070 + id as u16;
+            let direccion = |id: u32| SocketAddr::from(([127, 0, 0, 1], puerto(id)));
+            // El "líder" 9: un listener que jamás procesa nada.
+            let _colgado = TcpListener::bind(direccion(9)).unwrap();
+
+            let estaciones: HashMap<EstacionId, SocketAddr> = [1, 2, 9]
+                .into_iter()
+                .map(|id| (EstacionId(id), direccion(id)))
+                .collect();
+            let mut actores = Vec::new();
+            for id in [1u32, 2] {
+                let estacion = Estacion::new(
+                    EstacionId(id),
+                    (0.0, 0.0),
+                    vec![Slot::nuevo(0).start()],
+                    pasarela,
+                    (EstacionId(9), direccion(9)),
+                    false,
+                    estaciones.clone(),
+                )
+                .start();
+                let comunicador =
+                    Comunicador::new(direccion(id), direccion(id), estacion.clone().recipient())
+                        .start();
+                estacion
+                    .send(RegistrarComunicador(comunicador))
+                    .await
+                    .unwrap();
+                actores.push(estacion);
+            }
+
+            // Los sondeos vencen por timeout de lectura (5s c/u), la elección
+            // arranca y el anillo saltea al colgado: gana la 2 (mayor id vivo).
+            let mut convergio = false;
+            for _ in 0..60 {
+                actix::clock::sleep(std::time::Duration::from_millis(500)).await;
+                let info1 = actores[0].send(ConsultarLider).await.unwrap();
+                let info2 = actores[1].send(ConsultarLider).await.unwrap();
+                if info1.lider_id == Some(EstacionId(2))
+                    && info2.lider_id == Some(EstacionId(2))
+                    && info2.soy_lider
+                {
+                    convergio = true;
+                    break;
+                }
+            }
+            assert!(
+                convergio,
+                "ambas estaciones deberían reconocer a la 2 como líder pese al colgado"
+            );
         });
     }
 
