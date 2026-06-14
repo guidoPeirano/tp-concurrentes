@@ -23,6 +23,7 @@ Trabajo Práctico — Programación Concurrente (75.59) — Facultad de Ingenier
 9. [Estructura del proyecto](#9-estructura-del-proyecto)
 10. [Cómo ejecutar el sistema](#10-cómo-ejecutar-el-sistema)
 11. [Decisiones de diseño](#11-decisiones-de-diseño)
+12. [Cambios desde la primera entrega](#12-cambios-desde-la-primera-entrega)
 
 ---
 
@@ -128,26 +129,31 @@ struct Estacion {
     id: EstacionId,
     ubicacion: (f64, f64),
     slots: Vec<Addr<Slot>>,
-    alquileres_propios: HashMap<RentalId, Alquiler>,
-    pagos_pendientes: Vec<PagoPendiente>,
+    pasarela: SocketAddr,
+    lider: SocketAddr,                              // derivado del id por config
+    lider_id: EstacionId,
+    estaciones: HashMap<EstacionId, SocketAddr>,    // membresía estática (config)
     rol: RolEstacion,
-    lider_conocido: EstadoLider,
-    term_actual: u64,
-    comunicador: Addr<Comunicador>,
-    archivo_persistencia: PathBuf,
+    eleccion: Eleccion,                             // anillo + term + EstadoLider
+    comunicador: Option<Addr<Comunicador>>,
+    alquileres_propios: HashMap<RentalId, Alquiler>,
+    eventos_pendientes: Vec<MensajeEntreEstacionesTCP>, // cola de diferidos al líder
+    commits_pendientes: HashMap<TransaccionId, String>, // decisión COMMIT write-ahead
+    pagos_pendientes: Vec<PagoPendiente>,               // alquileres offline (Caso E)
+    archivo: Option<PathBuf>,                           // persistencia opcional (--estado)
 }
 
 enum RolEstacion {
     Lider {
-        registro_alquileres: HashMap<RentalId, Alquiler>,
-        cache_estados: HashMap<EstacionId, EstadoEstacion>,
-        eventos_procesados: HashSet<EventId>,
+        registro: Registro,                          // alquileres autoritativos
+        cache: HashMap<EstacionId, InfoEstacion>,    // estados para consultas (CU3)
+        eventos: HashSet<EventId>,                   // dedup de eventos (Caso D)
     },
     Follower,
 }
 
 enum EstadoLider {
-    Conocido(EstacionId, SocketAddr),
+    Conocido(EstacionId),   // la dirección se deriva de la tabla de la config
     EnEleccion,
     Desconocido,
 }
@@ -247,31 +253,26 @@ A `Estacion`: `Voto(Yes/No)`, `BiciLiberada`, `BiciAsegurada`, `EstadoSlot`.
 
 ```rust
 struct Comunicador {
-    estacion_id: EstacionId,
-    estacion_addr: Addr<Estacion>,
-    socket_tcp: TcpListener,
-    socket_udp: UdpSocket,
-    conexiones_tcp: HashMap<EstacionId, TcpStream>,
-    vecinas: HashMap<EstacionId, SocketAddr>,
-    pasarela_addr: SocketAddr,
-    servicios: ServiciosAlcanzables,
-    cola_para_lider: VecDeque<MensajeAlLider>,
-}
-
-/// Qué servicios alcanza la estación en este momento. Se actualiza según el
-/// resultado de los intentos de conexión (éxito / timeout). Permite distinguir,
-/// por ejemplo, llegar a la pasarela pero no al líder, o viceversa.
-struct ServiciosAlcanzables {
-    pasarela: bool,
-    lider: bool,
-}
-
-struct MensajeAlLider {
-    event_id: EventId,
-    payload: PayloadSerializado,
-    intentos: u32,
+    addr_tcp: SocketAddr,
+    addr_udp: SocketAddr,
+    destino: Recipient<PaqueteRecibido>,   // el actor de negocio (Estacion o ProcesadorPagos)
+    socket_udp: Option<UdpSocket>,
+    /// Servicios alcanzables, POR DIRECCIÓN: el resultado de la última
+    /// operación TCP saliente hacia cada destino. Las direcciones caídas se
+    /// re-sondean cada 3s para detectar que volvieron. Es la generalización
+    /// del `ServiciosAlcanzables { pasarela, lider }` del primer diseño: al
+    /// ser por dirección, el Comunicador sigue siendo agnóstico del dominio.
+    alcanzables: HashMap<SocketAddr, bool>,
+    /// Corte de red simulado por consola (descarta todo lo que entra y sale).
+    desconectado: Arc<AtomicBool>,
 }
 ```
+
+> La `cola_para_lider` del primer diseño se mudó a la `Estacion`
+> (`eventos_pendientes`): el Comunicador trabaja con bytes y direcciones, y no
+> sabe quién es el líder; la estación, que sí lo sabe, encola lo que no se pudo
+> entregar y lo reintenta cuando el líder vuelve a responder (o se lo aplica a
+> sí misma si ganó la elección).
 
 A diferencia del usuario, la estación **no** tiene un estado global "conectada / desconectada": o alcanza un servicio o no, y eso puede variar servicio por servicio. La `Estacion` no consulta un flag global: intenta enviar a través del `Comunicador` y reacciona al resultado (voto recibido vs. timeout).
 
@@ -279,12 +280,13 @@ A diferencia del usuario, la estación **no** tiene un estado global "conectada 
 
 | Mensaje | Origen | Comportamiento |
 |---|---|---|
-| `EnviarConfiable { destino, payload }` | Estacion | Envía por TCP. Si falla, reintenta o encola según el destino. |
-| `EnviarGossip { destino, payload }` | Estacion | Envía por UDP, fire and forget. |
-| `EnviarAlLider { payload }` | Estacion | Si conoce al líder, lo envía. Si no, encola. |
-| `MensajeRecibidoDeRed { origen, payload }` | Tasks de escucha | Reenvía al actor `Estacion`. |
-| `NuevoLider { id, term }` | Estacion (tras Coordinator) | Actualiza dirección del líder, dispara `FlushCola`. |
-| `FlushCola` | self | Reenvía mensajes pendientes al líder actual. |
+| `EnviarTcp { destino, datos }` | actor de negocio | Envía por TCP (framing), fire and forget. |
+| `EnviarUdp { destino, datos }` | actor de negocio | Envía un datagrama UDP. |
+| `ConsultarTcp { destino, datos }` | actor de negocio | Request-response (en un thread, sin bloquear el arbiter); lectura acotada a 5s. |
+| `EnviarTcpConfirmado { destino, datos }` | actor de negocio | Envío que reporta si la conexión/escritura funcionó. |
+| `ConsultarAlcanzable { destino }` | actor de negocio | ¿La última operación hacia esa dirección anduvo? (Caso E). |
+| `SimularConectividad { conectado }` | consola del proceso | Activa/desactiva el corte de red simulado. |
+| `PaqueteRecibido { datos, responder }` | threads de escucha | Payload entrante hacia el actor de negocio (con canal de respuesta si fue TCP). |
 
 ### 4.2 Aplicación `pasarela`
 
@@ -297,27 +299,22 @@ A diferencia del usuario, la estación **no** tiene un estado global "conectada 
 ```rust
 struct ProcesadorPagos {
     pre_autorizaciones: HashMap<String, PreAutorizacion>,
-    cobros_realizados: Vec<Cobro>,
     tarifa: TarifaConfig,
-    archivo_persistencia: PathBuf,
+    contador: u64,                 // para ids de preauth únicos (sobrevive reinicios)
+    timeout_transaccion: Duration, // Caso B
+    archivo: Option<PathBuf>,      // persistencia opcional (--estado)
 }
 
 struct PreAutorizacion {
-    id: String,
-    usuario_id: UsuarioId,
-    tarjeta: DatosTarjeta,
-    monto_reservado: f64,
-    estacion_solicitante: EstacionId,
-    timestamp: Timestamp,
-    estado: EstadoPreAuth,
     tx_id: Option<TransaccionId>,
+    monto_reservado: f64,
+    estado: EstadoPreAuth,
 }
 
 enum EstadoPreAuth {
     Preparada,
     Activa,
     Cobrada { monto_final: f64 },
-    CobroFallido { motivo: String },
     Anulada,
 }
 
@@ -417,7 +414,8 @@ enum MensajeEstacionAUsuario {
     AlquilerConfirmado {
         rental_id: RentalId,
         bici_id: BiciId,
-        preauth_id: String,
+        /// `None` si el alquiler salió en modo desconectado (Caso E).
+        preauth_id: Option<String>,
     },
     AlquilerRechazado {
         motivo: String,
@@ -428,13 +426,10 @@ enum MensajeEstacionAUsuario {
     DevolucionRechazada {
         motivo: String,
     },
-    DevolucionCompletada {
-        rental_id: RentalId,
-        monto_cobrado: f64,
-        tiempo_uso_minutos: u32,
-    },
 }
 ```
+
+> Sobre la devolución: el usuario recibe `DevolucionAceptada` apenas la bici queda asegurada en el slot y ahí termina su interacción; el cobro y el cierre corren en background entre estaciones (el primer diseño tenía un `DevolucionCompletada` hacia el usuario que resultó innecesario).
 
 **Consultas (discovery del líder y disponibilidad):**
 
@@ -518,20 +513,19 @@ enum MensajeEntreEstacionesTCP {
         t1: Timestamp,
         monto_cobrado: f64,
     },
+    // ACK de los mensajes del Ring (un nodo colgado acepta la conexión pero
+    // no contesta: sin este ACK la elección se trabaría en él)
     EventoProcesadoAck { event_id: EventId },
 
-    // Reconstrucción de registro
+    // Reconstrucción de registro y reincorporación tardía
     SolicitarAlquileresAbiertos { term: u64 },
     RespuestaAlquileres { alquileres: Vec<Alquiler> },
     IngresoTardio { alquileres: Vec<Alquiler> },
 
-    // Manejo de bicis huérfanas
+    // Manejo de bicis huérfanas (la estación destino busca al dueño)
     BuscarAlquilerPropio { event_id: EventId, bici_id: BiciId },
     AlquilerEncontrado { event_id: EventId, alquiler: Alquiler },
     NoLoTengo { event_id: EventId, bici_id: BiciId },
-    AlquilerNoEncontrado { bici_id: BiciId },
-    ReprocesarDevolucion { bici_id: BiciId },
-    BiciHuerfanaConfirmada { bici_id: BiciId },
 
     // Ring de elección
     Election { ids: Vec<EstacionId>, iniciador: EstacionId },
@@ -700,7 +694,7 @@ struct PagoPendiente {
 
 **Regla clave: ningún alquiler se reporta al líder sin pre-autorización.** En el caso normal esto se cumple solo, porque el 2PC incluye la pre-autorización antes de confirmar el alquiler. En modo offline, el reporte al líder se **difiere** hasta haber obtenido la preauth. Como consecuencia, el registro del líder solo contiene alquileres con `preauth_id` válido, y por eso el `preauth_id` que el líder entrega en `DatosParaCobro` puede ser `String` (nunca `None`).
 
-**Nota de consistencia.** En modo offline se relaja deliberadamente la atomicidad estricta del 2PC: la bici puede entregarse antes de que exista una pre-autorización confirmada. Es una decisión consciente que prioriza la disponibilidad (que el usuario pueda sacar la bici aunque la estación no alcance al banco) por sobre la atomicidad. Si la pre-autorización diferida fracasa (p. ej. tarjeta sin fondos), la pasarela marca el cobro como `CobroFallido`; ese estado es dominio de la pasarela, no de la estación.
+**Nota de consistencia.** En modo offline se relaja deliberadamente la atomicidad estricta del 2PC: la bici puede entregarse antes de que exista una pre-autorización confirmada. Es una decisión consciente que prioriza la disponibilidad (que el usuario pueda sacar la bici aunque la estación no alcance al banco) por sobre la atomicidad. Si la pre-autorización diferida fracasa (p. ej. tarjeta inválida), el alquiler queda registrado como **CobroFallido** en la auditoría de la estación de origen y no se cobra nunca. (El primer diseño lo ponía como estado de la pasarela, pero un Prepare rechazado no deja ninguna pre-autorización que marcar: el dato existe solo del lado de la estación.)
 
 **Timeouts configurables:**
 
@@ -1223,3 +1217,25 @@ A continuación se resumen las decisiones tomadas durante el diseño, con su jus
 **Persistencia mínima en archivos JSON.** Cumple el requerimiento de no usar base de datos ni GUI. Cada actor con estado importante (Estacion, ProcesadorPagos) serializa periódicamente y al cambiar estados críticos. Al reiniciar, lee del archivo y reanuda.
 
 **Estados de usuario y alquiler como `enum`.** Modelar los estados como `enum` con variantes con datos asociados impide construir estados inválidos por construcción (por ejemplo, un usuario no puede "consultar bici" si está en variante `SinBici`).
+
+---
+
+## 12. Cambios desde la primera entrega
+
+Resumen de lo que cambió entre el diseño presentado en la primera entrega y la implementación final. Los cambios grandes vinieron de la corrección de cátedra; los demás aparecieron al implementar (en general, casos que el diseño en papel no forzaba a resolver).
+
+**Por la corrección de la primera entrega:**
+
+- **Se eliminó el proceso `cloud`.** Era un punto único de falla. Las consultas de disponibilidad (CU3) van directo de la app del usuario al líder, con un paso previo de discovery (`PreguntarLider` a cualquier estación). El paso "anuncio al cloud" del Ring desapareció con él.
+
+**Por la implementación:**
+
+- **`preauth_id` del alquiler pasó a `Option<String>`** (estaba previsto en el diseño pero el detalle quedó cerrado recién en la etapa de modo desconectado): `None` mientras un alquiler offline no se regularizó. La regla "ningún alquiler llega al líder sin preauth" hace que el resto del sistema siga trabajando con `String`.
+- **El Caso C (coordinador cae durante Commit) se reconcilió con el Caso B.** El diseño original ponía a la pasarela "esperando reintentos" indefinidamente y una detección de huérfanas a la hora; lo implementado es: write-ahead de la decisión COMMIT (persistida antes de enviarla) + reintento periódico idempotente, y la pasarela aplica su mismo timeout de transacción del Caso B. La "transacción huérfana a la hora" desapareció.
+- **`CobroFallido` se registra en la estación, no en la pasarela.** Un Prepare diferido rechazado no deja pre-autorización que marcar: el dato solo existe del lado de la estación de origen, que lo audita.
+- **La cola de mensajes al líder vive en la `Estacion`, no en el `Comunicador`.** El Comunicador trabaja con bytes y direcciones (es compartido con la pasarela); la estación es la que sabe quién es el líder y qué hacer con lo no entregado.
+- **`ServiciosAlcanzables` se generalizó a un mapa por dirección** en el Comunicador, actualizado con el resultado de cada operación saliente y con re-sondeo automático de lo caído.
+- **Los mensajes del Ring requieren ACK** (`EventoProcesadoAck`): un nodo colgado acepta la conexión a nivel kernel sin procesar nada, y sin ACK la elección se trababa en él. El mismo razonamiento llevó al timeout de lectura (5s) en las consultas TCP, que es lo que permite detectar a un líder colgado (no solo caído).
+- **El protocolo de huérfanas quedó dirigido por la estación destino** (busca al dueño con `BuscarAlquilerPropio` / `AlquilerEncontrado` / `NoLoTengo`). Tres mensajes del diseño original (`AlquilerNoEncontrado`, `ReprocesarDevolucion`, `BiciHuerfanaConfirmada`) resultaron innecesarios y se eliminaron: el reproceso es un mensaje interno de la propia destino y la confirmación de huérfana es un evento de auditoría local. También se eliminó `DevolucionCompletada` hacia el usuario (su interacción termina en `DevolucionAceptada`).
+- **La persistencia es opt-in** (`--estado <ruta>` en estación y pasarela), con escritura atómica (tmp + rename). El rol y el term no se persisten: se rearman por config + elección. Los slots tampoco: representan el estado físico de la dársena.
+- **Simulación de fallas por consola:** `desconectar`/`conectar` en estación y pasarela descartan todo el tráfico del proceso (equivale a un proceso colgado para el resto del sistema); `desconectar`/`conectar` en la app del usuario activan el modo `SoloLocal`.

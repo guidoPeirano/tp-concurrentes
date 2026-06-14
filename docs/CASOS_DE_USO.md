@@ -202,4 +202,4 @@ Estación A        B          C          E (gana, id mayor)
 
 - **`usuario_estacion.rs`**: operaciones → CU1/CU2; consultas/discovery → CU3.
 - **`estacion_pasarela.rs`**: `Prepare*`/`Commit*`/`Abort*Preauth` + `Voto` → CU1; `ProcesarCobro` + `Cobro*` → CU2.
-- **`estacion_estacion.rs`**: `AlquilerAbierto` → CU1; `NotificarDevolucion`/`DatosParaCobro`/`NoRegistradoAun`/`DevolucionProcesada`/`CierreAlquiler` + huérfanas → CU2; `Election`/`Coordinator`/`Solicitar*`/`Respuesta*`/`IngresoTardio` → CU4; `EstadoEstacion` (UDP) → CU3.
+- **`estacion_estacion.rs`**: `AlquilerAbierto` → CU1; `NotificarDevolucion`/`DatosParaCobro`/`NoRegistradoAun`/`DevolucionProcesada`/`CierreAlquiler` + `BuscarAlquilerPropio`/`AlquilerEncontrado`/`NoLoTengo` (huérfanas) → CU2; `Election`/`Coordinator`/`EventoProcesadoAck` (ACK del anillo)/`Solicitar*`/`Respuesta*`/`IngresoTardio` → CU4; `EstadoEstacion` (UDP) → CU3.
