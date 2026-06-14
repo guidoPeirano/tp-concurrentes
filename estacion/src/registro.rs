@@ -42,6 +42,12 @@ impl Registro {
         }
     }
 
+    /// ¿El registro ya conoce este alquiler (activo o cerrado)? Evita que un
+    /// `IngresoTardio` re-abra un alquiler que el líder ya cerró.
+    pub fn contiene(&self, rental_id: &RentalId) -> bool {
+        self.alquileres.contains_key(rental_id)
+    }
+
     /// Cantidad de alquileres activos (para diagnóstico/consulta).
     pub fn activos(&self) -> usize {
         self.alquileres

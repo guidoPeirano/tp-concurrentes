@@ -55,12 +55,6 @@ pub enum MensajeEstacionAUsuario {
     DevolucionAceptada { bici_id: BiciId },
     /// CU2 — no se pudo asegurar la bici (slot ocupado o inexistente).
     DevolucionRechazada { motivo: String },
-    /// CU2 — el líder cerró el alquiler y la pasarela cobró.
-    DevolucionCompletada {
-        rental_id: RentalId,
-        monto_cobrado: f64,
-        tiempo_uso_minutos: u32,
-    },
 }
 
 // --- Consultas: discovery del líder y disponibilidad ---

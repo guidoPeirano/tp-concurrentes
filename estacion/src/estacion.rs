@@ -140,6 +140,9 @@ pub struct Estacion {
     alquileres_propios: HashMap<RentalId, Alquiler>,
     /// Contador para generar ids únicos de transacción, alquiler y evento.
     contador: u64,
+    /// Último líder visto por `aplicar_liderazgo` (detecta el cambio para la
+    /// reincorporación tardía).
+    lider_id_anterior: EstacionId,
     /// Sondeos al líder fallidos consecutivos (la vigilancia los cuenta).
     fallos_lider: u8,
     /// Intervalos de vigilancia transcurridos con la elección sin resolver.
@@ -220,6 +223,7 @@ impl Estacion {
             comunicador: None,
             alquileres_propios: HashMap::new(),
             contador: 0,
+            lider_id_anterior: lider_id,
             fallos_lider: 0,
             intervalos_en_eleccion: 0,
             eventos_pendientes: Vec::new(),
@@ -728,6 +732,19 @@ impl Estacion {
                 }
             }
 
+            // --- CU4: reincorporación tardía ---
+            MensajeEntreEstacionesTCP::IngresoTardio { alquileres } => {
+                if let RolEstacion::Lider { registro, .. } = &mut self.rol {
+                    for alquiler in alquileres {
+                        // Solo lo que el registro no conoce: si el líder ya lo
+                        // tiene (incluso cerrado), la versión del líder manda.
+                        if !registro.contiene(&alquiler.rental_id) {
+                            registro.agregar(alquiler);
+                        }
+                    }
+                }
+            }
+
             // --- Ring de elección (CU4) ---
             // Los mensajes del anillo se ACKean: el que reenvía solo da por
             // entregado si recibe respuesta (un nodo colgado acepta la conexión
@@ -823,6 +840,8 @@ impl Estacion {
         if let Some(addr) = self.estaciones.get(&lider_id).copied() {
             self.lider = addr;
         }
+        let lider_cambio = lider_id != self.lider_id_anterior;
+        self.lider_id_anterior = lider_id;
         let soy_lider = lider_id == self.id;
         let era_lider = matches!(self.rol, RolEstacion::Lider { .. });
         if soy_lider && !era_lider {
@@ -839,6 +858,25 @@ impl Estacion {
         }
         // Con líder conocido (sea quien sea), los eventos diferidos se reintentan.
         self.descargar_pendientes(ctx);
+        // Reincorporación tardía (CU4): si soy follower con alquileres activos
+        // y acabo de enterarme de un líder nuevo, se los mando por las dudas
+        // (pude haber estado caída durante su reconstrucción). El líder solo
+        // incorpora los que no conoce, así no re-abre nada.
+        if lider_cambio && !soy_lider {
+            let alquileres: Vec<Alquiler> = self
+                .alquileres_propios
+                .values()
+                .filter(|a| a.estado == EstadoAlquiler::Activo)
+                .filter(|a| a.preauth_id.is_some())
+                .cloned()
+                .collect();
+            if !alquileres.is_empty() {
+                self.enviar_evento_al_lider(
+                    MensajeEntreEstacionesTCP::IngresoTardio { alquileres },
+                    ctx,
+                );
+            }
+        }
     }
 
     /// Reconstruye el registro del líder recién electo: arranca con los alquileres
@@ -2559,6 +2597,49 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn el_ingreso_tardio_solo_suma_lo_que_el_lider_no_conoce() {
+        System::new().block_on(async {
+            let pasarela = pasarela_mock(true);
+            let estacion = arrancar(vec![Slot::con_bici(0, BiciId(42)).start()], pasarela).await;
+
+            // El líder ya tiene un alquiler (R-1-1) y lo cierra.
+            let _ = estacion.send(alquilar(0)).await.unwrap();
+            let cierre = MensajeEntreEstacionesTCP::DevolucionProcesada {
+                event_id: EventId("E-cierre".to_string()),
+                rental_id: RentalId("R-1-1".to_string()),
+                monto_cobrado: 70.0,
+                tiempo_uso_minutos: 1,
+            };
+            estacion.send(paquete_tcp(&cierre, None)).await.unwrap();
+            assert_eq!(estacion.send(ConsultarRegistro).await.unwrap(), 0);
+
+            // Una estación que se reincorpora tarde manda su versión (vieja,
+            // todavía Activa) de R-1-1 + un alquiler que el líder no conocía.
+            let alquiler = |rental: &str, bici: u32| Alquiler {
+                rental_id: RentalId(rental.to_string()),
+                bici_id: BiciId(bici),
+                usuario_id: UsuarioId("bob".to_string()),
+                estacion_origen: EstacionId(7),
+                inicio: Timestamp(0),
+                fin: None,
+                preauth_id: Some("P-tardio".to_string()),
+                estado: EstadoAlquiler::Activo,
+            };
+            let tardio = MensajeEntreEstacionesTCP::IngresoTardio {
+                alquileres: vec![alquiler("R-1-1", 42), alquiler("R-tardio", 77)],
+            };
+            estacion.send(paquete_tcp(&tardio, None)).await.unwrap();
+
+            // Solo el desconocido entra; el cerrado NO se re-abre.
+            assert_eq!(
+                estacion.send(ConsultarRegistro).await.unwrap(),
+                1,
+                "R-tardio entra, R-1-1 sigue cerrado"
+            );
         });
     }
 
